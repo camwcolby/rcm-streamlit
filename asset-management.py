@@ -1,77 +1,96 @@
-# save as app_rcm.py
-import os, re
-import numpy as np
+# ==================== Data locations (GitHub-first, local fallback) ====================
+import os
+from io import StringIO
+
 import pandas as pd
+import requests
 import streamlit as st
 
-# ==================== Data locations (GitHub-first, local fallback) ====================
-import os, pandas as pd, streamlit as st
+# ⚠️ Streamlit wants this to be the first Streamlit call in the file
+st.set_page_config(page_title="RCM Explorer", layout="wide")
+st.title("RCM Explorer — Portfolio")
 
-# Your repo/branch where the CSVs live
-GH_OWNER  = "camwcolby"
-GH_REPO   = "rcm-streamlit"
-GH_BRANCH = "data"  # <- you put the CSVs on the 'data' branch
-def gh_raw(path: str) -> str:
+# --- Your repo/branch where the CSVs live ---
+GH_OWNER   = "camwcolby"
+GH_REPO    = "rcm-streamlit"
+# Allow branch override via URL param ?data_branch=<branch> or env var RCM_DATA_BRANCH
+GH_BRANCH  = st.query_params.get("data_branch", os.environ.get("RCM_DATA_BRANCH", "data"))
+
+def gh_raw_url(path: str) -> str:
+    # raw file on a specific branch
     return f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{path}"
 
-# Optional: let local dev override via env var; safe to leave as your Windows path
+# Optional: local dev override via env var; safe to leave as your Windows path
 LOCAL_OUT_DIR = os.environ.get(
     "RCM_LOCAL_OUT_DIR",
     r"C:\Users\cacolby\Desktop\Asset Management Data Analysis\Gap Analysis"
 )
 
-# File names (must match what you committed to the data branch)
+# Filenames committed to the branch above
 ASSET_FILE = "rcm_asset_scores_v2.csv"
 ACT_FILE   = "rcm_activity_recommendations_v2.csv"
-GAP_FILE   = "gap_activity_level_exact.csv"  # optional for baseline backfill
+GAP_FILE   = "gap_activity_level_exact.csv"  # optional backfill for baseline
 
 def _local_path(name: str):
-    if LOCAL_OUT_DIR:
-        return os.path.join(LOCAL_OUT_DIR, name)
-    return None
+    return os.path.join(LOCAL_OUT_DIR, name) if LOCAL_OUT_DIR else None
 
-@st.cache_data(show_spinner=False)
-def load_csv_smart(file_name: str) -> tuple[pd.DataFrame, str]:
-    """
-    Try local path (if it exists) then GitHub raw URL. Returns (df, source_used).
-    """
-    candidates = []
-    lp = _local_path(file_name)
+def _candidate_sources(filename: str):
+    """Try local path, then GitHub root, then GitHub /data subfolder."""
+    srcs = []
+    lp = _local_path(filename)
     if lp and os.path.exists(lp):
-        candidates.append(lp)  # local (when running on your own PC)
-    candidates.append(gh_raw(file_name))  # GitHub (for Streamlit Cloud)
+        srcs.append(("local", lp))
+    # GitHub candidates
+    srcs.append(("github", gh_raw_url(filename)))           # root of branch
+    srcs.append(("github", gh_raw_url(f"data/{filename}"))) # optional data/ folder
+    return srcs
 
-    last_err = None
-    for src in candidates:
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_csv_smart(file_name: str):
+    """
+    Try local path (if it exists) then GitHub raw URL(s).
+    Returns (df, source_used).
+    """
+    errs = []
+    for kind, src in _candidate_sources(file_name):
         try:
-            df = pd.read_csv(src, low_memory=False)
+            if kind == "local":
+                df = pd.read_csv(src, low_memory=False)
+            else:
+                # Use requests for clearer errors/timeouts
+                r = requests.get(src, timeout=20)
+                r.raise_for_status()
+                df = pd.read_csv(StringIO(r.text), low_memory=False)
             df.columns = df.columns.astype(str).str.strip()
             return df, src
         except Exception as e:
-            last_err = e
+            errs.append(f"- {src} -> {type(e).__name__}: {e}")
             continue
-    # If both fail, stop the app with a clear message
-    st.error(f"Could not load '{file_name}'. Last error:\n{last_err}")
+    st.error(f"Could not load **{file_name}** from any source.\nTried:\n" + "\n".join(errs))
     st.stop()
 
 # ==================== Load CSVs ====================
 assets, assets_src = load_csv_smart(ASSET_FILE)
 acts,   acts_src   = load_csv_smart(ACT_FILE)
 
-# GAP is optional; try to load but don't fail if missing on GitHub
-gap = None
+# GAP is optional; attempt but don’t fail if missing
 try:
     gap, gap_src = load_csv_smart(GAP_FILE)
 except Exception:
+    gap = None
     gap_src = None
 
-st.caption(f"Data sources → Assets: {assets_src} | Activities: {acts_src}" + (f" | Gap: {gap_src}" if gap_src else ""))
+st.caption(
+    "Data sources → "
+    f"Assets: {assets_src} | Activities: {acts_src}"
+    + (f" | Gap: {gap_src}" if gap_src else "")
+)
 
-
-# Match your notebook window for baseline rate
+# ==================== Analysis window (keep under this block) ====================
 WINDOW_START = pd.Timestamp("2022-01-01")
 WINDOW_END   = pd.Timestamp("2024-12-31")
 YEARS = (WINDOW_END - WINDOW_START).days / 365.25
+
 
 st.set_page_config(page_title="RCM Explorer", layout="wide")
 st.title("RCM Explorer — Portfolio")
