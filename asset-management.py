@@ -86,11 +86,11 @@ except Exception:
     gap = None
     gap_src = None
 
-st.caption(
-    "Sources → "
-    f"Assets: {assets_src} | Activities: {acts_src}"
-    + (f" | Gap: {gap_src}" if gap_src else " | Gap: (not loaded)")
-)
+#st.caption(
+#    "Sources → "
+#    f"Assets: {assets_src} | Activities: {acts_src}"
+#    + (f" | Gap: {gap_src}" if gap_src else " | Gap: (not loaded)")
+#)
 
 # ==================== Helpers ====================
 def norm_text(s):
