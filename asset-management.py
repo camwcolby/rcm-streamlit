@@ -1,21 +1,25 @@
 # ==================== Data locations (GitHub-first, local fallback) ====================
 import os, io, re
 import requests
-import numpy as np          # <-- add this line
+import numpy as np
 import pandas as pd
 import streamlit as st
+
+# Set page config ONCE and before other Streamlit calls
+st.set_page_config(page_title="RCM Explorer", layout="wide")
+st.title("RCM Explorer — Portfolio")
 
 # Where the data is in GitHub
 GH_OWNER   = "camwcolby"
 GH_REPO    = "rcm-streamlit"
-GH_BRANCH1 = "main"   # your default branch
-GH_BRANCH2 = "data"   # older location you used before (kept as fallback)
+GH_BRANCH1 = "main"   # primary branch
+GH_BRANCH2 = "data"   # legacy branch (kept as fallback)
 GH_SUBDIR  = "data"   # folder inside the repo
 
 def _gh_raw(branch: str, path: str) -> str:
     return f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{branch}/{path}"
 
-# Optional local override for development on your PC
+# Optional local override for development on your PC (set env var to a folder path)
 LOCAL_OUT_DIR = os.environ.get("RCM_LOCAL_OUT_DIR", None)
 
 ASSET_FILE = "rcm_asset_scores_v2.csv"
@@ -23,11 +27,11 @@ ACT_FILE   = "rcm_activity_recommendations_v2.csv"
 GAP_FILE   = "gap_activity_level_exact.csv"   # optional
 
 def _candidate_urls(fname: str):
-    # GitHub candidates (preferred first)
+    # Try common layouts you might use in the repo
     return [
         _gh_raw(GH_BRANCH1, f"{GH_SUBDIR}/{fname}"),  # main/data/...
         _gh_raw(GH_BRANCH1, fname),                   # main/...
-        _gh_raw(GH_BRANCH2, f"{GH_SUBDIR}/{fname}"),  # data/data/... (older)
+        _gh_raw(GH_BRANCH2, f"{GH_SUBDIR}/{fname}"),  # data/data/...
         _gh_raw(GH_BRANCH2, fname),                   # data/...
     ]
 
@@ -50,7 +54,6 @@ def read_csv_smart(fname: str) -> tuple[pd.DataFrame, str]:
         try:
             r = requests.get(url, timeout=30, headers={"User-Agent": "streamlit-app"})
             r.raise_for_status()
-            # Use pandas from in-memory text to avoid odd urlopen behaviors
             df = pd.read_csv(io.StringIO(r.text), low_memory=False)
             df.columns = df.columns.astype(str).str.strip()
             return df, url
@@ -68,11 +71,11 @@ def read_csv_smart(fname: str) -> tuple[pd.DataFrame, str]:
             errors.append(f"{lp} → {type(e).__name__}: {e}")
 
     # If we got here, everything failed
-    msg = "Could not load **{fname}** from any source. Tried:\n\n" + "\n".join(f"- {e}" for e in errors)
+    msg = f"Could not load **{fname}** from any source. Tried:\n\n" + "\n".join(f"- {e}" for e in errors)
     st.error(msg)
     st.stop()
 
-# ==================== Load CSVs ====================
+# ---------- Load CSVs once (GitHub-first) ----------
 assets, assets_src = read_csv_smart(ASSET_FILE)
 acts,   acts_src   = read_csv_smart(ACT_FILE)
 
@@ -88,19 +91,6 @@ st.caption(
     f"Assets: {assets_src} | Activities: {acts_src}"
     + (f" | Gap: {gap_src}" if gap_src else " | Gap: (not loaded)")
 )
-
-# ==================== Window & page setup ====================
-WINDOW_START = pd.Timestamp("2022-01-01")
-WINDOW_END   = pd.Timestamp("2024-12-31")
-YEARS = (WINDOW_END - WINDOW_START).days / 365.25
-
-st.set_page_config(page_title="RCM Explorer", layout="wide")
-st.title("RCM Explorer — Portfolio")
-
-
-
-st.set_page_config(page_title="RCM Explorer", layout="wide")
-st.title("RCM Explorer — Portfolio")
 
 # ==================== Helpers ====================
 def norm_text(s):
@@ -164,17 +154,15 @@ def _pick_col(df, *cands):
             return norm[key]
     return None
 
-# ==================== Load CSVs ====================
-assets = pd.read_csv(ASSET_CSV, low_memory=False)
-acts   = pd.read_csv(ACT_CSV,   low_memory=False)
-
-# Strip headers (important if Excel/ETL left spaces/BOM)
-assets.columns = assets.columns.astype(str).str.strip()
-acts.columns   = acts.columns.astype(str).str.strip()
-
-# Normalize keys immediately
+# Normalize keys immediately (using the data we just loaded)
 assets = coerce_keys_str(assets)
 acts   = coerce_keys_str(acts)
+
+# ==================== Window parameters ====================
+WINDOW_START = pd.Timestamp("2022-01-01")
+WINDOW_END   = pd.Timestamp("2024-12-31")
+YEARS = (WINDOW_END - WINDOW_START).days / 365.25
+
 
 # ==================== Rebuild baseline_per_year only if ABSENT ====================
 acts["Activity_norm_app"] = acts.get("Activity", "").astype(str).map(norm_text)
