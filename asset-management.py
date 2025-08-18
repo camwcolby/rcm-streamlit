@@ -1,45 +1,101 @@
-# ==================== Data locations (GitHub raw URLs) ====================
+# ==================== Data locations (GitHub-first, local fallback) ====================
+import os, io, re
+import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="RCM Explorer", layout="wide")
-st.title("RCM Explorer — Portfolio")
+# Where the data is in GitHub
+GH_OWNER   = "camwcolby"
+GH_REPO    = "rcm-streamlit"
+GH_BRANCH1 = "main"   # your default branch
+GH_BRANCH2 = "data"   # older location you used before (kept as fallback)
+GH_SUBDIR  = "data"   # folder inside the repo
 
-# Read from the data branch at repo root
-ASSET_CSV = "https://raw.githubusercontent.com/camwcolby/rcm-streamlit/data/rcm_asset_scores_v2.csv"
-ACT_CSV   = "https://raw.githubusercontent.com/camwcolby/rcm-streamlit/data/rcm_activity_recommendations_v2.csv"
-GAP_CSV   = "https://raw.githubusercontent.com/camwcolby/rcm-streamlit/data/gap_activity_level_exact.csv"
+def _gh_raw(branch: str, path: str) -> str:
+    return f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{branch}/{path}"
 
-# ⚠️ Optional local override for dev (ignored on Streamlit Cloud)
-import os
-LOCAL_OUT_DIR = os.environ.get("RCM_LOCAL_OUT_DIR", "")
-if LOCAL_OUT_DIR and os.path.exists(LOCAL_OUT_DIR):
-    ASSET_CSV = os.path.join(LOCAL_OUT_DIR, "rcm_asset_scores_v2.csv")
-    ACT_CSV   = os.path.join(LOCAL_OUT_DIR, "rcm_activity_recommendations_v2.csv")
-    GAP_CSV   = os.path.join(LOCAL_OUT_DIR, "gap_activity_level_exact.csv")
+# Optional local override for development on your PC
+LOCAL_OUT_DIR = os.environ.get("RCM_LOCAL_OUT_DIR", None)
+
+ASSET_FILE = "rcm_asset_scores_v2.csv"
+ACT_FILE   = "rcm_activity_recommendations_v2.csv"
+GAP_FILE   = "gap_activity_level_exact.csv"   # optional
+
+def _candidate_urls(fname: str):
+    # GitHub candidates (preferred first)
+    return [
+        _gh_raw(GH_BRANCH1, f"{GH_SUBDIR}/{fname}"),  # main/data/...
+        _gh_raw(GH_BRANCH1, fname),                   # main/...
+        _gh_raw(GH_BRANCH2, f"{GH_SUBDIR}/{fname}"),  # data/data/... (older)
+        _gh_raw(GH_BRANCH2, fname),                   # data/...
+    ]
+
+def _local_candidate(fname: str):
+    if LOCAL_OUT_DIR:
+        lp = os.path.join(LOCAL_OUT_DIR, fname)
+        if os.path.exists(lp):
+            return lp
+    return None
+
+def read_csv_smart(fname: str) -> tuple[pd.DataFrame, str]:
+    """
+    Try (1) GitHub raw URLs (several variants), then (2) local path if available.
+    Returns (DataFrame, source_used). Stops the app with a helpful error if all fail.
+    """
+    errors = []
+
+    # 1) GitHub raw
+    for url in _candidate_urls(fname):
+        try:
+            r = requests.get(url, timeout=30, headers={"User-Agent": "streamlit-app"})
+            r.raise_for_status()
+            # Use pandas from in-memory text to avoid odd urlopen behaviors
+            df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+            df.columns = df.columns.astype(str).str.strip()
+            return df, url
+        except Exception as e:
+            errors.append(f"{url} → {type(e).__name__}: {e}")
+
+    # 2) Local file (for dev)
+    lp = _local_candidate(fname)
+    if lp:
+        try:
+            df = pd.read_csv(lp, low_memory=False)
+            df.columns = df.columns.astype(str).str.strip()
+            return df, lp
+        except Exception as e:
+            errors.append(f"{lp} → {type(e).__name__}: {e}")
+
+    # If we got here, everything failed
+    msg = "Could not load **{fname}** from any source. Tried:\n\n" + "\n".join(f"- {e}" for e in errors)
+    st.error(msg)
+    st.stop()
 
 # ==================== Load CSVs ====================
-assets = pd.read_csv(ASSET_CSV, low_memory=False)
-acts   = pd.read_csv(ACT_CSV,   low_memory=False)
+assets, assets_src = read_csv_smart(ASSET_FILE)
+acts,   acts_src   = read_csv_smart(ACT_FILE)
 
-# GAP is optional: try to load but don’t fail app if missing
+# GAP is optional
 try:
-    gap = pd.read_csv(GAP_CSV, low_memory=False)
-    gap_src = GAP_CSV
+    gap, gap_src = read_csv_smart(GAP_FILE)
 except Exception:
     gap = None
     gap_src = None
 
 st.caption(
-    "Data sources → "
-    f"Assets: {ASSET_CSV} | Activities: {ACT_CSV}"
+    "Sources → "
+    f"Assets: {assets_src} | Activities: {acts_src}"
     + (f" | Gap: {gap_src}" if gap_src else " | Gap: (not loaded)")
 )
 
-# ==================== Analysis window ====================
+# ==================== Window & page setup ====================
 WINDOW_START = pd.Timestamp("2022-01-01")
 WINDOW_END   = pd.Timestamp("2024-12-31")
 YEARS = (WINDOW_END - WINDOW_START).days / 365.25
+
+st.set_page_config(page_title="RCM Explorer", layout="wide")
+st.title("RCM Explorer — Portfolio")
+
 
 
 st.set_page_config(page_title="RCM Explorer", layout="wide")
