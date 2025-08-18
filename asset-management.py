@@ -1,6 +1,7 @@
 # ==================== Data locations (GitHub-first, local fallback) ====================
 import os, io, re
 import requests
+import numpy as np          # <-- add this line
 import pandas as pd
 import streamlit as st
 
