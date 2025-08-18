@@ -440,16 +440,12 @@ assets_df = (
 )
 
 # Helper: find cost-like numeric columns and apply $ formatting with 2 decimals
-def format_money_styler(df: pd.DataFrame, extra_keys=("cost","usd")) -> pd.io.formats.style.Styler:
-    money_cols = [
-        c for c in df.columns
-        if any(k in c.lower() for k in extra_keys)
-        and pd.api.types.is_numeric_dtype(df[c])
-    ]
-    if not money_cols:
-        return df.style  # nothing to format
-    fmt_map = {c: "${:,.2f}" for c in money_cols}
-    return df.style.format(fmt_map)
+def format_money_styler(df: pd.DataFrame, extra_keys=("cost","usd","rrv","risk","delta")):
+    keys = tuple(k.lower() for k in extra_keys)
+    money_cols = [c for c in df.columns if any(k in c.lower() for k in keys)]
+    fmt = lambda v: "" if pd.isna(v) else f"${v:,.2f}"
+    # If no money-like columns, return a Styler anyway so st.dataframe will accept it
+    return (df.style if not money_cols else df.style.format({c: fmt for c in money_cols}))
 
 # Show assets with currency formatting on cost-like columns
 st.dataframe(format_money_styler(assets_df), use_container_width=True)
