@@ -158,6 +158,15 @@ def _pick_col(df, *cands):
 assets = coerce_keys_str(assets)
 acts   = coerce_keys_str(acts)
 
+# Minimal schema sanity (fail fast with a helpful message)
+req_assets = ["__Area","__AssetID_norm"]
+if not all(c in assets.columns for c in req_assets):
+    st.error(f"Assets CSV missing required columns: { [c for c in req_assets if c not in assets.columns] }"); st.stop()
+
+req_acts = ["__Area","__AssetID_norm","Activity"]
+if not all(c in acts.columns for c in req_acts):
+    st.error(f"Activities CSV missing required columns: { [c for c in req_acts if c not in acts.columns] }"); st.stop()
+
 # ==================== Window parameters ====================
 WINDOW_START = pd.Timestamp("2022-01-01")
 WINDOW_END   = pd.Timestamp("2024-12-31")
@@ -169,17 +178,15 @@ acts["Activity_norm_app"] = acts.get("Activity", "").astype(str).map(norm_text)
 
 has_baseline_col = "baseline_per_year" in acts.columns
 if not has_baseline_col:
-    # Only rebuild from gap when the column is missing
-    if os.path.exists(GAP_CSV):
-        gap = pd.read_csv(GAP_CSV, low_memory=False)
-        gap.columns = gap.columns.astype(str).str.strip()
-        gap = coerce_keys_str(gap)
-        gap["Activity_norm_app"] = gap.get("Activity", "").astype(str).map(norm_text)
+    if gap is not None:
+        gap_local = gap.copy()
+        gap_local = coerce_keys_str(gap_local)
+        gap_local["Activity_norm_app"] = gap_local.get("Activity", "").astype(str).map(norm_text)
 
-        base = (gap.rename(columns={"Completed_Count": "_cmpl"})
-                    .groupby(["__Area","__AssetID_norm","Activity_norm_app"], dropna=False)["_cmpl"]
-                    .sum()
-                    .reset_index())
+        base = (gap_local.rename(columns={"Completed_Count": "_cmpl"})
+                        .groupby(["__Area","__AssetID_norm","Activity_norm_app"], dropna=False)["_cmpl"]
+                        .sum()
+                        .reset_index())
         base = coerce_keys_str(base)
         base["baseline_per_year"] = base["_cmpl"] / YEARS
 
@@ -187,10 +194,10 @@ if not has_baseline_col:
             base[["__Area","__AssetID_norm","Activity_norm_app","baseline_per_year"]],
             on=["__Area","__AssetID_norm","Activity_norm_app"], how="left"
         )
-        st.info("baseline_per_year rebuilt from gap_activity_level_exact.csv (column was missing in ACT_CSV)")
+        st.info("baseline_per_year rebuilt from GAP CSV (already loaded).")
     else:
         acts["baseline_per_year"] = 0.0
-        st.warning("baseline_per_year missing and gap_activity_level_exact.csv not found; defaulting to 0.0")
+        st.warning("baseline_per_year missing and GAP CSV not available; defaulting to 0.0")
 
 # Ensure numeric and non-negative
 acts["baseline_per_year"] = pd.to_numeric(acts["baseline_per_year"], errors="coerce").fillna(0.0).clip(lower=0.0)
