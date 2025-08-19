@@ -1,38 +1,40 @@
-# ==================== Data locations (GitHub-first, local fallback) ====================
+# ==================== RCM Explorer — Portfolio (patched) ====================
+# Fixes:
+#  - Robust CoF/PoF construction (no NaNs even with $/comma strings)
+#  - Key normalization identical across assets & activities
+#  - Join fallback: if (__Area, __AssetID_norm) misses, retry on __AssetID_norm only
+#  - Clear coverage debug + safer filters (avoid "empty" assets table)
+
 import os, io, re
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Set page config ONCE and before other Streamlit calls
 st.set_page_config(page_title="RCM Explorer", layout="wide")
 st.title("RCM Explorer — Portfolio")
 
-# Where the data is in GitHub
+# ---------------- GitHub-first locations (local override via env) ----------------
 GH_OWNER   = "camwcolby"
 GH_REPO    = "rcm-streamlit"
-GH_BRANCH1 = "main"   # primary branch
-GH_BRANCH2 = "data"   # legacy branch (kept as fallback)
-GH_SUBDIR  = "data"   # folder inside the repo
-
-def _gh_raw(branch: str, path: str) -> str:
-    return f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{branch}/{path}"
-
-# Optional local override for development on your PC (set env var to a folder path)
+GH_BRANCH1 = "main"
+GH_BRANCH2 = "data"
+GH_SUBDIR  = "data"
 LOCAL_OUT_DIR = os.environ.get("RCM_LOCAL_OUT_DIR", None)
 
 ASSET_FILE = "rcm_asset_scores_v2.csv"
 ACT_FILE   = "rcm_activity_recommendations_v2.csv"
-GAP_FILE   = "gap_activity_level_exact.csv"   # optional
+GAP_FILE   = "gap_activity_level_exact.csv"   # optional, for baseline rebuild
+
+def _gh_raw(branch: str, path: str) -> str:
+    return f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{branch}/{path}"
 
 def _candidate_urls(fname: str):
-    # Try common layouts you might use in the repo
     return [
-        _gh_raw(GH_BRANCH1, f"{GH_SUBDIR}/{fname}"),  # main/data/...
-        _gh_raw(GH_BRANCH1, fname),                   # main/...
-        _gh_raw(GH_BRANCH2, f"{GH_SUBDIR}/{fname}"),  # data/data/...
-        _gh_raw(GH_BRANCH2, fname),                   # data/...
+        _gh_raw(GH_BRANCH1, f"{GH_SUBDIR}/{fname}"),
+        _gh_raw(GH_BRANCH1, fname),
+        _gh_raw(GH_BRANCH2, f"{GH_SUBDIR}/{fname}"),
+        _gh_raw(GH_BRANCH2, fname),
     ]
 
 def _local_candidate(fname: str):
@@ -42,25 +44,18 @@ def _local_candidate(fname: str):
             return lp
     return None
 
-def read_csv_smart(fname: str) -> tuple[pd.DataFrame, str]:
-    """
-    Try (1) GitHub raw URLs (several variants), then (2) local path if available.
-    Returns (DataFrame, source_used). Stops the app with a helpful error if all fail.
-    """
-    errors = []
-
-    # 1) GitHub raw
+def read_csv_smart(fname: str):
+    """Try GitHub raw (several layouts), then local override. Return (df, source)."""
+    errs = []
     for url in _candidate_urls(fname):
         try:
-            r = requests.get(url, timeout=30, headers={"User-Agent": "streamlit-app"})
+            r = requests.get(url, timeout=30, headers={"User-Agent":"streamlit-app"})
             r.raise_for_status()
             df = pd.read_csv(io.StringIO(r.text), low_memory=False)
             df.columns = df.columns.astype(str).str.strip()
             return df, url
         except Exception as e:
-            errors.append(f"{url} → {type(e).__name__}: {e}")
-
-    # 2) Local file (for dev)
+            errs.append(f"{url} → {type(e).__name__}: {e}")
     lp = _local_candidate(fname)
     if lp:
         try:
@@ -68,96 +63,18 @@ def read_csv_smart(fname: str) -> tuple[pd.DataFrame, str]:
             df.columns = df.columns.astype(str).str.strip()
             return df, lp
         except Exception as e:
-            errors.append(f"{lp} → {type(e).__name__}: {e}")
-
-    # If we got here, everything failed
-    msg = f"Could not load **{fname}** from any source. Tried:\n\n" + "\n".join(f"- {e}" for e in errors)
-    st.error(msg)
+            errs.append(f"{lp} → {type(e).__name__}: {e}")
+    st.error(f"Could not load **{fname}** from any source. Tried:\n\n" + "\n".join(f"- {x}" for x in errs))
     st.stop()
 
-# ---------- Load CSVs once (GitHub-first) ----------
 assets, assets_src = read_csv_smart(ASSET_FILE)
 acts,   acts_src   = read_csv_smart(ACT_FILE)
-
-# GAP is optional
 try:
     gap, gap_src = read_csv_smart(GAP_FILE)
 except Exception:
-    gap = None
-    gap_src = None
+    gap, gap_src = None, None
 
-#st.caption(
-#    "Sources → "
-#    f"Assets: {assets_src} | Activities: {acts_src}"
-#    + (f" | Gap: {gap_src}" if gap_src else " | Gap: (not loaded)")
-#)
-# --- Data sanity + resilient fallbacks (drop this after the "Load CSVs" section) ---
-
-# 1) If proposed_per_year is missing, try to reconstruct; else fall back to baseline
-if "proposed_per_year" not in acts.columns:
-    if {"cost_proposed_per_year","PM_cost_each"} <= set(acts.columns):
-        pmcost = pd.to_numeric(acts["PM_cost_each"], errors="coerce").replace(0, np.nan)
-        acts["proposed_per_year"] = (
-            pd.to_numeric(acts["cost_proposed_per_year"], errors="coerce") / pmcost
-        ).fillna(0.0).clip(lower=0.0)
-        st.warning("Reconstructed proposed_per_year = cost_proposed_per_year / PM_cost_each (column was missing).")
-    else:
-        acts["proposed_per_year"] = pd.to_numeric(acts.get("baseline_per_year", 0.0), errors="coerce").fillna(0.0)
-        st.warning("No proposed_per_year and cannot reconstruct from costs → using baseline_per_year as proposed_per_year.")
-
-# 2) If baseline coverage is suspiciously low, try to rebuild baseline from GAP
-try:
-    bpy = pd.to_numeric(acts.get("baseline_per_year", 0.0), errors="coerce").fillna(0.0)
-    coverage = float((bpy > 0).mean())
-except Exception:
-    coverage = 0.0
-
-if coverage < 0.20 and gap is not None and len(gap):
-    st.info(f"Baseline coverage is low ({coverage:.1%}). Rebuilding from gap_activity_level_exact.csv …")
-    # Normalize keys on gap
-    gap = gap.copy()
-    gap.columns = gap.columns.astype(str).str.strip()
-    def _norm_id_str(x):
-        s = "" if pd.isna(x) else str(x)
-        s = s.replace(",", "")
-        s = re.sub(r"\.0$", "", s)
-        s = re.sub(r"\s+","", s)
-        return s.upper()
-    def _norm_txt(x):
-        s = "" if pd.isna(x) else str(x).upper()
-        s = re.sub(r"[^A-Z0-9 ]+"," ", s)
-        return re.sub(r"\s+"," ", s).strip()
-
-    gap["__Area"]         = gap.get("__Area","").astype(str).str.strip()
-    gap["__AssetID_norm"] = gap.get("__AssetID_norm","").map(_norm_id_str)
-    # match your app’s normalizer for activities
-    act_col = "Activity" if "Activity" in gap.columns else gap.columns[0]
-    gap["Activity_norm_app"] = gap[act_col].astype(str).map(_norm_txt)
-
-    # roll up completions across the window you used to create GAP (your YEARS is already set)
-    base2 = (gap.rename(columns={"Completed_Count":"_cmpl"})
-                .groupby(["__Area","__AssetID_norm","Activity_norm_app"], dropna=False)["_cmpl"]
-                .sum()
-                .reset_index())
-    base2["baseline_per_year_rebuilt"] = base2["_cmpl"] / YEARS
-
-    # normalize acts keys and merge
-    acts["Activity_norm_app"] = acts.get("Activity","").astype(str).map(_norm_txt)
-    acts = acts.merge(
-        base2[["__Area","__AssetID_norm","Activity_norm_app","baseline_per_year_rebuilt"]],
-        on=["__Area","__AssetID_norm","Activity_norm_app"], how="left"
-    )
-    # fill when original baseline was 0 or NaN
-    acts["baseline_per_year"] = pd.to_numeric(acts.get("baseline_per_year", 0.0), errors="coerce")
-    acts.loc[(acts["baseline_per_year"].isna()) | (acts["baseline_per_year"]<=0), "baseline_per_year"] = \
-        acts["baseline_per_year_rebuilt"].fillna(0.0)
-    acts.drop(columns=["baseline_per_year_rebuilt"], inplace=True)
-
-    # show improved coverage
-    new_cov = float((pd.to_numeric(acts["baseline_per_year"], errors="coerce").fillna(0.0) > 0).mean())
-    st.success(f"Baseline rebuilt. Coverage improved to {new_cov:.1%}.")
-
-# ==================== Helpers ====================
+# ---------------- Normalizers & utilities ----------------
 def norm_text(s):
     s = "" if pd.isna(s) else str(s).upper()
     s = re.sub(r"[^A-Z0-9 ]+", " ", s)
@@ -166,16 +83,16 @@ def norm_text(s):
 def norm_id_str(x):
     s = "" if pd.isna(x) else str(x)
     s = s.replace(",", "")
-    s = re.sub(r"\.0$", "", s)         # remove Excel float tails like 12345.0
+    s = re.sub(r"\.0$", "", s)          # 1234.0 -> 1234
     s = re.sub(r"\s+", "", s)
     return s.upper()
 
-def coerce_keys_str(df):
-    """Make join keys consistent strings (prevents merge dtype errors)."""
+def coerce_keys(df):
+    df = df.copy()
     if "__AssetID_norm" in df.columns:
         df["__AssetID_norm"] = df["__AssetID_norm"].map(norm_id_str).astype(str)
     if "__Area" in df.columns:
-        df["__Area"] = df["__Area"].astype(str).str.strip()
+        df["__Area"] = df["__Area"].astype(str).str.strip().str.upper()
     return df
 
 def minmax01(s):
@@ -189,7 +106,6 @@ def sigmoid(x, k=1.0, bias=0.0):
     return 1.0 / (1.0 + np.exp(-k*(x + bias)))
 
 def coerce_year_col(df: pd.DataFrame, col: str) -> pd.Series:
-    """Return float year Series aligned to df.index from many formats."""
     if col not in df.columns:
         return pd.Series(np.nan, index=df.index, dtype=float)
     s = df[col]
@@ -201,17 +117,22 @@ def coerce_year_col(df: pd.DataFrame, col: str) -> pd.Series:
         y = y.fillna(y_fallback)
     return pd.Series(y.values, index=df.index, dtype="float64")
 
-def ensure_series(x, like_index, dtype="float64"):
-    return x if isinstance(x, pd.Series) else pd.Series(x, index=like_index, dtype=dtype)
+def num_series(df: pd.DataFrame, col: str, default=np.nan):
+    return pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series(default, index=df.index, dtype="float64")
 
-def num_series(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
-    """Numeric Series for a column, or a default Series aligned to df.index."""
-    if col in df.columns:
-        return pd.to_numeric(df[col], errors="coerce")
-    return pd.Series(default, index=df.index, dtype="float64")
+def parse_money_series(s):
+    """Parse strings like $12,345.67 → 12345.67; pass numeric through."""
+    if s is None:
+        return None
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    return pd.to_numeric(
+        s.astype(str).str.replace("(", "-", regex=False).str.replace(")", "", regex=False)
+         .str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce"
+    )
 
-def _pick_col(df, *cands):
-    """Case/space/punct-insensitive column matcher."""
+def pick_col(df, *cands):
     norm = {re.sub(r"[^a-z0-9]+","", c.lower()): c for c in df.columns}
     for cand in cands:
         key = re.sub(r"[^a-z0-9]+","", str(cand).lower())
@@ -219,60 +140,49 @@ def _pick_col(df, *cands):
             return norm[key]
     return None
 
-# Normalize keys immediately (using the data we just loaded)
-assets = coerce_keys_str(assets)
-acts   = coerce_keys_str(acts)
+# Apply key normalization immediately
+assets = coerce_keys(assets)
+acts   = coerce_keys(acts)
 
-# Minimal schema sanity (fail fast with a helpful message)
+# Minimal schema
 req_assets = ["__Area","__AssetID_norm"]
+req_acts   = ["__Area","__AssetID_norm","Activity"]
 if not all(c in assets.columns for c in req_assets):
-    st.error(f"Assets CSV missing required columns: { [c for c in req_assets if c not in assets.columns] }"); st.stop()
-
-req_acts = ["__Area","__AssetID_norm","Activity"]
+    st.error(f"Assets CSV missing required columns: {[c for c in req_assets if c not in assets.columns]}"); st.stop()
 if not all(c in acts.columns for c in req_acts):
-    st.error(f"Activities CSV missing required columns: { [c for c in req_acts if c not in acts.columns] }"); st.stop()
+    st.error(f"Activities CSV missing required columns: {[c for c in req_acts if c not in acts.columns]}"); st.stop()
 
-# ==================== Window parameters ====================
+# ---------------- Window & baseline rebuild (only if absent) ----------------
 WINDOW_START = pd.Timestamp("2022-01-01")
 WINDOW_END   = pd.Timestamp("2024-12-31")
 YEARS = (WINDOW_END - WINDOW_START).days / 365.25
 
-
-# ==================== Rebuild baseline_per_year only if ABSENT ====================
-acts["Activity_norm_app"] = acts.get("Activity", "").astype(str).map(norm_text)
-
-has_baseline_col = "baseline_per_year" in acts.columns
-if not has_baseline_col:
+acts["Activity_norm_app"] = acts["Activity"].astype(str).map(norm_text)
+if "baseline_per_year" not in acts.columns:
     if gap is not None:
-        gap_local = gap.copy()
-        gap_local = coerce_keys_str(gap_local)
-        gap_local["Activity_norm_app"] = gap_local.get("Activity", "").astype(str).map(norm_text)
-
-        base = (gap_local.rename(columns={"Completed_Count": "_cmpl"})
-                        .groupby(["__Area","__AssetID_norm","Activity_norm_app"], dropna=False)["_cmpl"]
-                        .sum()
-                        .reset_index())
-        base = coerce_keys_str(base)
+        g = coerce_keys(gap.copy())
+        act_col = "Activity" if "Activity" in g.columns else g.columns[0]
+        g["Activity_norm_app"] = g[act_col].astype(str).map(norm_text)
+        base = (g.rename(columns={"Completed_Count":"_cmpl"})
+                  .groupby(["__Area","__AssetID_norm","Activity_norm_app"], dropna=False)["_cmpl"]
+                  .sum()
+                  .reset_index())
         base["baseline_per_year"] = base["_cmpl"] / YEARS
-
         acts = acts.merge(
             base[["__Area","__AssetID_norm","Activity_norm_app","baseline_per_year"]],
             on=["__Area","__AssetID_norm","Activity_norm_app"], how="left"
         )
-        st.info("baseline_per_year rebuilt from GAP CSV (already loaded).")
+        st.info("baseline_per_year rebuilt from GAP CSV (absent in activities).")
     else:
         acts["baseline_per_year"] = 0.0
-        st.warning("baseline_per_year missing and GAP CSV not available; defaulting to 0.0")
+        st.warning("baseline_per_year missing and GAP CSV not available; defaulted to 0.")
 
-# Ensure numeric and non-negative
 acts["baseline_per_year"] = pd.to_numeric(acts["baseline_per_year"], errors="coerce").fillna(0.0).clip(lower=0.0)
 
-# ==================== Sidebar: filters & knobs ====================
+# ---------------- Sidebar knobs ----------------
 st.sidebar.header("Filters")
-areas = sorted(assets["__Area"].dropna().unique().tolist()) if "__Area" in assets.columns else []
+areas = sorted(assets["__Area"].dropna().unique().tolist())
 area_sel = st.sidebar.multiselect("Area(s)", areas)
-
-risk_min = st.sidebar.number_input("Min Annual Risk (USD)", 0.0, 1e8, 0.0, step=1000.0)
 
 st.sidebar.header("CoF knobs")
 use_csv_cof = st.sidebar.checkbox("Use CoF from CSV (Jupyter)", value=True)
@@ -289,7 +199,7 @@ st.sidebar.header("Decision line")
 k = st.sidebar.slider("Increase approval factor (RRV ≥ k × ΔCost)", 0.0, 3.0, 1.0, 0.1)
 
 st.sidebar.header("PoF recompute (optional)")
-recompute_pof = st.sidebar.checkbox("Recompute PoF in app (uses Age/Condition/Risk/Compliance if present)", value=False)
+recompute_pof = st.sidebar.checkbox("Recompute PoF in app (uses Age/Condition/Compliance if present)", value=False)
 sigmoid_k_ui  = st.sidebar.slider("PoF steepness (k)", 0.1, 3.0, 1.1, 0.1)
 pof_bias      = st.sidebar.slider("PoF bias", -1.0, 1.0, 0.0, 0.1)
 st.sidebar.caption("Weights (normalized to sum to 1)")
@@ -300,93 +210,106 @@ w_risk  = st.sidebar.slider("w_prior",  0.0, 1.0, 0.10, 0.05)
 w_rx    = st.sidebar.slider("w_rehab",  0.0, 1.0, 0.10, 0.05)
 rx_horizon_years = st.sidebar.slider("Rehab horizon (yrs)", 1, 20, 5, 1)
 
-# Apply area filter early so all downstream views match
+risk_min = st.sidebar.number_input("Min Annual Risk (USD)", 0.0, 1e8, 0.0, step=1000.0)
+
+# Area filter (early)
 if area_sel:
     assets = assets[assets["__Area"].isin(area_sel)].copy()
     acts   = acts[acts["__Area"].isin(area_sel)].copy()
 
-# ==================== Assets: CoF/PoF & annual risk ====================
+# ---------------- Assets: build CoF/PoF & Annual Risk (robust) ----------------
 assets_calc = assets.copy()
 
-if use_csv_cof and "CoF_USD_v2" in assets.columns:
-    assets_calc["CoF_USD_app"] = pd.to_numeric(assets["CoF_USD_v2"], errors="coerce").fillna(0.0)
+# CoF from CSV if present (robust to $/commas); else compute from knobs
+if use_csv_cof and ("CoF_USD_v2" in assets_calc.columns):
+    cof = parse_money_series(assets_calc["CoF_USD_v2"])
+    assets_calc["CoF_USD_app"] = cof.fillna(0.0)
 else:
     dt_hours = assets_calc["__Downtime_hours_est"] if "__Downtime_hours_est" in assets_calc.columns \
                else pd.Series(downtime_default_hr, index=assets_calc.index)
     cof_score = num_series(assets_calc, "Governing COF Score", 0.0).fillna(0.0)
     rep_best  = num_series(assets_calc, "RepCost_best", 0.0).fillna(0.0)
     assets_calc["CoF_USD_app"] = (
-        pd.to_numeric(dt_hours, errors="coerce").fillna(downtime_default_hr) * usd_per_downtime_hour
-        + cof_score * penalty_unit_usd
-        + rep_best * rep_cost_pct
-    )
+        pd.to_numeric(dt_hours, errors="coerce").fillna(downtime_default_hr) * float(usd_per_downtime_hour)
+        + cof_score * float(penalty_unit_usd)
+        + rep_best * float(rep_cost_pct)
+    ).fillna(0.0)
 
+# PoF: either recompute or use CSV/fallback=0.5
 if recompute_pof:
     age01   = minmax01(assets_calc.get("Age_years", 0))
     cond01  = minmax01(assets_calc.get("Condition Score", 0))
     comp    = pd.to_numeric(assets_calc.get("Compliance_rate", np.nan), errors="coerce")
     nonc01  = (1.0 - comp).clip(0,1) if isinstance(comp, pd.Series) else pd.Series(0.0, index=assets_calc.index)
     risk01  = minmax01(assets_calc.get("Asset Risk Score", 0))
-    next_y = pd.Series(np.nan, index=assets_calc.index, dtype=float)
+    next_y  = pd.Series(np.nan, index=assets_calc.index, dtype=float)
     for cand in ["__NextInvestYear", "Governing Rehab Replace Year", "Governing Rehab/Replace Year"]:
         if cand in assets_calc.columns:
-            next_y = coerce_year_col(assets_calc, cand)
-            break
+            next_y = coerce_year_col(assets_calc, cand); break
     yrs_to = next_y - float(pd.Timestamp.now().year)
-    urg01  = ensure_series((rx_horizon_years - yrs_to) / rx_horizon_years, assets_calc.index).clip(0.0, 1.0).fillna(0.0)
+    urg01  = ((float(rx_horizon_years) - yrs_to) / float(rx_horizon_years)).clip(0.0, 1.0).fillna(0.0)
     tot = max(1e-9, (w_age + w_cond + w_ncomp + w_risk + w_rx))
     w_age_n, w_cond_n, w_ncomp_n, w_risk_n, w_rx_n = (w_age/tot, w_cond/tot, w_ncomp/tot, w_risk/tot, w_rx/tot)
     lin = (w_age_n*age01 + w_cond_n*cond01 + w_ncomp_n*nonc01 + w_risk_n*risk01 + w_rx_n*urg01)
-    assets_calc["PoF_app"] = sigmoid(lin, k=sigmoid_k_ui, bias=pof_bias).clip(0,1)
+    assets_calc["PoF_app"] = sigmoid(lin, k=sigmoid_k_ui, bias=pof_bias).clip(0,1).fillna(0.0)
 else:
     assets_calc["PoF_app"] = pd.to_numeric(assets_calc.get("PoF", 0.5), errors="coerce").clip(0,1).fillna(0.5)
 
-assets_calc["Annual_Risk_USD_app"] = assets_calc["PoF_app"] * assets_calc["CoF_USD_app"]
-assets_view = assets_calc[assets_calc["Annual_Risk_USD_app"] >= risk_min].copy()
-
-# ==================== Activities: harden PM cost & recompute decisions ====================
-acts_calc = acts.copy()
-
-# Baseline per year already ensured. Now robust proposed_per_year detection.
-acts_calc["baseline_per_year"] = num_series(acts_calc, "baseline_per_year", 0.0).fillna(0.0).clip(lower=0.0)
-
-prop_col = _pick_col(
-    acts_calc,
-    "proposed_per_year", "Proposed_per_year", "proposed rate", "proposed",
-    "proposed_rate", "proposedperyear"
+assets_calc["Annual_Risk_USD_app"] = (
+    pd.to_numeric(assets_calc["PoF_app"], errors="coerce").fillna(0.0) *
+    pd.to_numeric(assets_calc["CoF_USD_app"], errors="coerce").fillna(0.0)
 )
+
+# Filter view (avoid NaN filtering issues)
+risk_series = pd.to_numeric(assets_calc["Annual_Risk_USD_app"], errors="coerce").fillna(-1.0)
+assets_view = assets_calc[risk_series >= float(risk_min)].copy()
+
+# ---------------- Activities: PM costs, join CoF/PoF, decisions ----------------
+acts_calc = acts.copy()
+acts_calc["baseline_per_year"] = pd.to_numeric(acts_calc.get("baseline_per_year", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+
+# proposed_per_year (use column if present/valid; else baseline)
+prop_col = pick_col(acts_calc, "proposed_per_year", "Proposed_per_year", "proposed rate", "proposed", "proposed_rate")
 if prop_col is None:
     acts_calc["proposed_per_year"] = acts_calc["baseline_per_year"]
-    st.info("No proposed_per_year-like column found in ACT_CSV; using baseline_per_year as proposed.")
 else:
-    acts_calc["proposed_per_year"] = pd.to_numeric(acts_calc[prop_col], errors="coerce")
-    if acts_calc["proposed_per_year"].isna().all():
-        acts_calc["proposed_per_year"] = acts_calc["baseline_per_year"]
-        st.info(f"Column '{prop_col}' is empty/NaN; using baseline_per_year as proposed.")
-    acts_calc["proposed_per_year"] = acts_calc["proposed_per_year"].fillna(0.0).clip(lower=0.0)
+    ppy = pd.to_numeric(acts_calc[prop_col], errors="coerce")
+    acts_calc["proposed_per_year"] = ppy.where(ppy.notna(), acts_calc["baseline_per_year"]).clip(lower=0.0)
 
-# PM hours (fallback 2.0)
-acts_calc["PM_hours"] = num_series(acts_calc, "PM_hours", np.nan).fillna(2.0).clip(lower=0.0)
-
-# PM cost each = CSV if >0 else PM_hours * labor_rate_override (+ material adder)
-pmc = num_series(acts_calc, "PM_cost_each", np.nan)
-pmc_fallback = acts_calc["PM_hours"] * float(labor_rate_override)
-acts_calc["PM_cost_each"] = pmc.where(pmc > 0, pmc_fallback).fillna(pmc_fallback)
+# PM costs
+acts_calc["PM_hours"] = pd.to_numeric(acts_calc.get("PM_hours", np.nan), errors="coerce").fillna(2.0).clip(lower=0.0)
+pmc = pd.to_numeric(acts_calc.get("PM_cost_each", np.nan), errors="coerce")
+acts_calc["PM_cost_each"] = pmc.where(pmc > 0, acts_calc["PM_hours"]*float(labor_rate_override)).fillna(acts_calc["PM_hours"]*float(labor_rate_override))
 if float(material_adder) > 0:
     acts_calc["PM_cost_each"] = acts_calc["PM_cost_each"] + float(material_adder)
 
-# Join CoF & PoF from assets_calc (ensures decisions align with app knobs)
+# --- Attach CoF/PoF from assets (ID+Area join; fallback to ID-only) ---
 key_cols = ["__Area","__AssetID_norm"]
 if all(c in assets_calc.columns for c in key_cols) and all(c in acts_calc.columns for c in key_cols):
     acts_calc = acts_calc.merge(
         assets_calc[key_cols + ["CoF_USD_app","PoF_app"]],
         on=key_cols, how="left"
     )
-else:
-    acts_calc["CoF_USD_app"] = pd.to_numeric(acts_calc.get("CoF_USD_v2", 0), errors="coerce").fillna(0.0)
-    acts_calc["PoF_app"]     = pd.to_numeric(acts_calc.get("PoF", 0.5), errors="coerce").clip(0,1).fillna(0.5)
 
-# Costs & RRV with tuned PM cost
+# Fallback: if coverage < 80%, try __AssetID_norm only
+coverage = float(acts_calc["CoF_USD_app"].notna().mean()) if "CoF_USD_app" in acts_calc.columns else 0.0
+if coverage < 0.80:
+    miss = acts_calc["CoF_USD_app"].isna() if "CoF_USD_app" in acts_calc.columns else pd.Series(True, index=acts_calc.index)
+    by_id = assets_calc[["__AssetID_norm","CoF_USD_app","PoF_app"]].drop_duplicates("__AssetID_norm")
+    acts_calc = acts_calc.merge(by_id, on="__AssetID_norm", how="left", suffixes=("","_byid"))
+    # fill only the missing ones from the ID-only match
+    if "CoF_USD_app" not in acts_calc.columns: acts_calc["CoF_USD_app"] = np.nan
+    if "PoF_app" not in acts_calc.columns:     acts_calc["PoF_app"]     = np.nan
+    acts_calc.loc[miss, "CoF_USD_app"] = acts_calc.loc[miss, "CoF_USD_app_byid"]
+    acts_calc.loc[miss, "PoF_app"]     = acts_calc.loc[miss, "PoF_app_byid"]
+    acts_calc.drop(columns=[c for c in ["CoF_USD_app_byid","PoF_app_byid"] if c in acts_calc.columns], inplace=True)
+    coverage = float(acts_calc["CoF_USD_app"].notna().mean())
+
+# Final fallback safety: zeros instead of NaNs so math proceeds
+acts_calc["CoF_USD_app"] = pd.to_numeric(acts_calc.get("CoF_USD_app", 0.0), errors="coerce").fillna(0.0)
+acts_calc["PoF_app"]     = pd.to_numeric(acts_calc.get("PoF_app", 0.5),   errors="coerce").clip(0,1).fillna(0.5)
+
+# Economics & RRV
 bpy = acts_calc["baseline_per_year"]
 ppy = acts_calc["proposed_per_year"]
 eff = pd.to_numeric(acts_calc.get("eff_per_event", 0.05), errors="coerce").fillna(0.05)
@@ -403,7 +326,7 @@ delta_pof = np.where(
 acts_calc["Delta_PoF_app"] = delta_pof
 acts_calc["RRV_USD_app"]   = acts_calc["Delta_PoF_app"] * acts_calc["CoF_USD_app"]
 
-# Tuned decision
+# Decisions (tuned)
 acts_calc["Decision_tuned"] = np.where(
     acts_calc["cost_delta_per_year"] > 0,
     np.where(acts_calc["RRV_USD_app"] >= k * acts_calc["cost_delta_per_year"], "INCREASE", "KEEP_BASELINE"),
@@ -412,42 +335,46 @@ acts_calc["Decision_tuned"] = np.where(
              "KEEP_BASELINE")
 )
 
-# --- Approved plan vs requested proposal (clarifies the "contradiction") ---
-
-# What we actually plan to spend after decisions
+# Approved plan vs baseline
 acts_calc["Approved_cost_per_year"] = np.where(
     acts_calc["Decision_tuned"] == "INCREASE",
-    acts_calc["cost_proposed_per_year"],                            # fund the increase
-    np.where(
-        acts_calc["Decision_tuned"] == "REDUCE",
-        acts_calc["cost_proposed_per_year"],                        # take the reduction
-        acts_calc["cost_baseline_per_year"]                         # keep baseline
-    )
+    acts_calc["cost_proposed_per_year"],
+    np.where(acts_calc["Decision_tuned"] == "REDUCE",
+             acts_calc["cost_proposed_per_year"],
+             acts_calc["cost_baseline_per_year"])
 )
+acts_calc["Approved_delta_per_year"] = acts_calc["Approved_cost_per_year"] - acts_calc["cost_baseline_per_year"]
+acts_calc["Approved_RRV_USD"] = np.where(acts_calc["Decision_tuned"] == "KEEP_BASELINE", 0.0, acts_calc["RRV_USD_app"])
 
-# Approved delta vs baseline
-acts_calc["Approved_delta_per_year"] = (
-    acts_calc["Approved_cost_per_year"] - acts_calc["cost_baseline_per_year"]
-)
+# ---------------- Views & summaries ----------------
+def format_money_styler(df: pd.DataFrame, extra_keys=("cost","usd","rrv","risk","delta")):
+    keys = tuple(k.lower() for k in extra_keys)
+    money_cols = [c for c in df.columns if any(k in c.lower() for k in keys)]
+    fmt = lambda v: "" if pd.isna(v) else f"${v:,.2f}"
+    return (df.style if not money_cols else df.style.format({c: fmt for c in money_cols}))
 
-# Approved risk reduction (KEEP_BASELINE contributes zero)
-acts_calc["Approved_RRV_USD"] = np.where(
-    acts_calc["Decision_tuned"] == "KEEP_BASELINE", 0.0, acts_calc["RRV_USD_app"]
-)
+st.subheader("Assets — ranked by annual risk (using app knobs)")
+assets_cols_show = [c for c in [
+    "__Area","__AssetID_norm","Asset Type","PoF_app","CoF_USD_app","Annual_Risk_USD_app",
+    "Age_years","Condition Score","RepCost_best","Governing COF Score"
+] if c in assets_calc.columns]
+assets_df = assets_view[assets_cols_show].sort_values("Annual_Risk_USD_app", ascending=False).head(500).copy()
+st.dataframe(format_money_styler(assets_df), use_container_width=True)
 
-# Area × decision rollup (approved)
+st.divider()
+st.subheader("Activities — decisions & ROI")
+
+# Rollup by area & decision
 roll = (acts_calc
+        .assign(Risk_Reduction_USD = pd.to_numeric(acts_calc.get("RRV_USD_app", 0), errors="coerce").fillna(0.0))
         .groupby(["__Area","Decision_tuned"], as_index=False)[
-            ["cost_baseline_per_year","Approved_cost_per_year","Approved_delta_per_year","Approved_RRV_USD"]
+            ["cost_baseline_per_year","cost_proposed_per_year","Risk_Reduction_USD"]
         ].sum())
+roll["Net_Cost_Delta"] = roll["cost_proposed_per_year"] - roll["cost_baseline_per_year"]
+st.write("Rollup (tuned decisions):")
+st.dataframe(format_money_styler(roll), use_container_width=True)
 
-roll = roll.rename(columns={
-    "Approved_cost_per_year": "approved_cost_per_year",
-    "Approved_delta_per_year": "approved_net_delta",
-    "Approved_RRV_USD":       "approved_risk_reduction_usd"
-})
-
-# Area net summary (single line per area)
+# Area net (approved)
 area_net = (acts_calc
             .groupby("__Area", as_index=False)[
                 ["cost_baseline_per_year","Approved_cost_per_year","Approved_delta_per_year","Approved_RRV_USD"]
@@ -458,84 +385,17 @@ area_net = (acts_calc
                 "Approved_delta_per_year":"approved_net_delta",
                 "Approved_RRV_USD":"approved_risk_reduction_usd"
             }))
-
-# Optional ROI at area level for the funded increases only
 inc_mask = acts_calc["Approved_delta_per_year"] > 0
 roi_area = (acts_calc[inc_mask]
             .groupby("__Area", as_index=False)[["Approved_delta_per_year","Approved_RRV_USD"]]
             .sum()
-            .rename(columns={"Approved_delta_per_year":"inc_delta_sum",
-                             "Approved_RRV_USD":"inc_rrv_sum"}))
+            .rename(columns={"Approved_delta_per_year":"inc_delta_sum","Approved_RRV_USD":"inc_rrv_sum"}))
 area_net = area_net.merge(roi_area, on="__Area", how="left")
-area_net["ROI_for_increases"] = np.where(
-    area_net["inc_delta_sum"] > 0, area_net["inc_rrv_sum"] / area_net["inc_delta_sum"], np.nan
-)
-
-st.subheader("Activities — decisions & ROI (approved)")
-st.caption("Approved = what will actually be done after decision rules, not just what was requested.")
-st.dataframe(
-    roll.sort_values(["__Area","Decision_tuned"]),
-    use_container_width=True
-)
+area_net["ROI_for_increases"] = np.where(area_net["inc_delta_sum"] > 0,
+                                         area_net["inc_rrv_sum"] / area_net["inc_delta_sum"], np.nan)
 
 st.markdown("**Area net (single verdict per area):**")
-st.dataframe(
-    area_net.sort_values("approved_net_delta", ascending=False),
-    use_container_width=True
-)
-
-# ==================== Quick sanity ====================
-st.caption("Quick debug: nonzero counts in activity inputs (post-harden)")
-st.write({
-    "baseline_per_year>0": int((acts_calc["baseline_per_year"] > 0).sum()),
-    "proposed_per_year>0": int((acts_calc["proposed_per_year"] > 0).sum()),
-    "PM_hours>0":          int((acts_calc["PM_hours"] > 0).sum()),
-    "PM_cost_each>0":      int((acts_calc["PM_cost_each"] > 0).sum()),
-    "cost_baseline>0":     int((acts_calc["cost_baseline_per_year"] > 0).sum()),
-    "cost_proposed>0":     int((acts_calc["cost_proposed_per_year"] > 0).sum()),
-})
-
-# ==================== Views ====================
-st.subheader("Assets — ranked by annual risk (using app knobs)")
-
-assets_cols_show = [c for c in [
-    "__Area","__AssetID_norm","Asset Type","PoF_app","CoF_USD_app","Annual_Risk_USD_app",
-    "Age_years","Condition Score","RepCost_best","Governing COF Score"
-] if c in assets_calc.columns]
-
-# Build view df
-assets_df = (
-    assets_view[assets_cols_show]
-    .sort_values("Annual_Risk_USD_app", ascending=False)
-    .head(500)
-    .copy()
-)
-
-# Helper: find cost-like numeric columns and apply $ formatting with 2 decimals
-def format_money_styler(df: pd.DataFrame, extra_keys=("cost","usd","rrv","risk","delta")):
-    keys = tuple(k.lower() for k in extra_keys)
-    money_cols = [c for c in df.columns if any(k in c.lower() for k in keys)]
-    fmt = lambda v: "" if pd.isna(v) else f"${v:,.2f}"
-    # If no money-like columns, return a Styler anyway so st.dataframe will accept it
-    return (df.style if not money_cols else df.style.format({c: fmt for c in money_cols}))
-
-# Show assets with currency formatting on cost-like columns
-st.dataframe(format_money_styler(assets_df), use_container_width=True)
-
-st.divider()
-st.subheader("Activities — decisions & ROI")
-
-# Rollup table
-roll = (acts_calc
-        .assign(Risk_Reduction_USD = pd.to_numeric(acts_calc.get("RRV_USD_app", 0), errors="coerce").fillna(0.0))
-        .groupby(["__Area","Decision_tuned"], as_index=False)[
-            ["cost_baseline_per_year","cost_proposed_per_year","Risk_Reduction_USD"]
-        ].sum()
-        .copy())
-roll["Net_Cost_Delta"] = roll["cost_proposed_per_year"] - roll["cost_baseline_per_year"]
-
-st.write("Rollup (tuned decisions):")
-st.dataframe(format_money_styler(roll), use_container_width=True)
+st.dataframe(format_money_styler(area_net), use_container_width=True)
 
 # Detailed activities table
 view_cols = [c for c in [
@@ -544,18 +404,24 @@ view_cols = [c for c in [
     "cost_baseline_per_year","cost_proposed_per_year","cost_delta_per_year",
     "CoF_USD_app","PoF_app","Delta_PoF_app","RRV_USD_app","Decision_tuned"
 ] if c in acts_calc.columns]
-
-acts_df = (
-    acts_calc[view_cols]
-    .sort_values(["Decision_tuned","RRV_USD_app"], ascending=[True, False])
-    .head(2000)
-    .copy()
-)
-
+acts_df = (acts_calc[view_cols]
+           .sort_values(["Decision_tuned","RRV_USD_app"], ascending=[True, False])
+           .head(2000)
+           .copy())
 st.dataframe(format_money_styler(acts_df), use_container_width=True)
 
+# ---------------- Quick debug ----------------
+st.caption("Quick debug:")
+st.write({
+    "assets: PoF_app>0": int((pd.to_numeric(assets_calc["PoF_app"], errors="coerce")>0).sum()),
+    "assets: CoF_USD_app>0": int((pd.to_numeric(assets_calc["CoF_USD_app"], errors="coerce")>0).sum()),
+    "join coverage (CoF in acts)": f"{(acts_calc['CoF_USD_app'].notna().mean()*100):.1f}%",
+    "acts: baseline>0": int((acts_calc["baseline_per_year"]>0).sum()),
+    "acts: proposed>0": int((acts_calc["proposed_per_year"]>0).sum()),
+    "acts: RRV_USD_app>0": int((pd.to_numeric(acts_calc["RRV_USD_app"], errors='coerce')>0).sum()),
+})
 
-# ==================== Downloads ====================
+# ---------------- Downloads ----------------
 st.download_button("⬇️ Download assets (filtered)",
                    data=assets_view.to_csv(index=False).encode("utf-8-sig"),
                    file_name="assets_filtered.csv", mime="text/csv")
