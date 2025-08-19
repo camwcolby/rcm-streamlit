@@ -490,8 +490,6 @@ st.dataframe(
     use_container_width=True,
 )
 
-
-
 # ---------------- Downloads ----------------
 st.download_button("⬇️ Download assets (filtered)",
                    data=assets_view.to_csv(index=False).encode("utf-8-sig"),
