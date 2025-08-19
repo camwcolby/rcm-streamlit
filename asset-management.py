@@ -95,6 +95,12 @@ def coerce_keys(df):
         df["__Area"] = df["__Area"].astype(str).str.strip().str.upper()
     return df
 
+def series_or_default(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """Return numeric Series df[col] if present; else a default-valued Series aligned to df.index."""
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce")
+    return pd.Series(default, index=df.index, dtype="float64")
+
 def minmax01(s):
     s = pd.to_numeric(s, errors="coerce")
     lo, hi = s.min(skipna=True), s.max(skipna=True)
@@ -235,34 +241,51 @@ else:
         + rep_best * float(rep_cost_pct)
     ).fillna(0.0)
 
-# PoF: either recompute or use CSV/fallback=0.5
+# --- PoF: either recompute or use CSV/fallback=0.5 ---
 if recompute_pof:
-    age01   = minmax01(assets_calc.get("Age_years", 0))
-    cond01  = minmax01(assets_calc.get("Condition Score", 0))
-    comp    = pd.to_numeric(assets_calc.get("Compliance_rate", np.nan), errors="coerce")
-    nonc01  = (1.0 - comp).clip(0,1) if isinstance(comp, pd.Series) else pd.Series(0.0, index=assets_calc.index)
-    risk01  = minmax01(assets_calc.get("Asset Risk Score", 0))
-    next_y  = pd.Series(np.nan, index=assets_calc.index, dtype=float)
+    cond01    = minmax01(series_or_default(assets_calc, "Condition Score", 0.0)).fillna(0.0)
+    age01     = minmax01(series_or_default(assets_calc, "Age_years", 0.0)).fillna(0.0)
+    noncomp01 = (1.0 - series_or_default(assets_calc, "Compliance_rate", 0.0)).clip(0, 1).fillna(0.0)
+    risk01    = minmax01(series_or_default(assets_calc, "Asset Risk Score", 0.0)).fillna(0.0)
+
+    # Rehab urgency (0..1) from next investment / R&R year
+    next_y = pd.Series(np.nan, index=assets_calc.index, dtype="float64")
     for cand in ["__NextInvestYear", "Governing Rehab Replace Year", "Governing Rehab/Replace Year"]:
         if cand in assets_calc.columns:
-            next_y = coerce_year_col(assets_calc, cand); break
+            next_y = coerce_year_col(assets_calc, cand)
+            break
     yrs_to = next_y - float(pd.Timestamp.now().year)
     urg01  = ((float(rx_horizon_years) - yrs_to) / float(rx_horizon_years)).clip(0.0, 1.0).fillna(0.0)
-    tot = max(1e-9, (w_age + w_cond + w_ncomp + w_risk + w_rx))
-    w_age_n, w_cond_n, w_ncomp_n, w_risk_n, w_rx_n = (w_age/tot, w_cond/tot, w_ncomp/tot, w_risk/tot, w_rx/tot)
-    lin = (w_age_n*age01 + w_cond_n*cond01 + w_ncomp_n*nonc01 + w_risk_n*risk01 + w_rx_n*urg01)
-    assets_calc["PoF_app"] = sigmoid(lin, k=sigmoid_k_ui, bias=pof_bias).clip(0,1).fillna(0.0)
-else:
-    assets_calc["PoF_app"] = pd.to_numeric(assets_calc.get("PoF", 0.5), errors="coerce").clip(0,1).fillna(0.5)
 
+    # Use whichever non-compliance weight you actually named in the UI
+    try:
+        w_noncomp_eff = float(w_noncomp)
+    except NameError:
+        w_noncomp_eff = float(w_ncomp)
+
+    # Normalize weights so the scale is stable
+    tot = max(1e-9, float(w_age) + float(w_cond) + w_noncomp_eff + float(w_risk) + float(w_rx))
+    w_age_n   = float(w_age)   / tot
+    w_cond_n  = float(w_cond)  / tot
+    w_ncomp_n = w_noncomp_eff  / tot
+    w_risk_n  = float(w_risk)  / tot
+    w_rx_n    = float(w_rx)    / tot
+
+    lin = (w_age_n*age01 +
+           w_cond_n*cond01 +
+           w_ncomp_n*noncomp01 +
+           w_risk_n*risk01 +
+           w_rx_n*urg01)
+    assets_calc["PoF_app"] = sigmoid(lin, k=float(sigmoid_k_ui), bias=float(pof_bias)).clip(0, 1).fillna(0.0)
+else:
+    assets_calc["PoF_app"] = pd.to_numeric(assets_calc.get("PoF", 0.5), errors="coerce").clip(0, 1).fillna(0.5)
+
+# Annual risk uses the app-side CoF you've already computed
 assets_calc["Annual_Risk_USD_app"] = (
     pd.to_numeric(assets_calc["PoF_app"], errors="coerce").fillna(0.0) *
     pd.to_numeric(assets_calc["CoF_USD_app"], errors="coerce").fillna(0.0)
 )
 
-# Filter view (avoid NaN filtering issues)
-risk_series = pd.to_numeric(assets_calc["Annual_Risk_USD_app"], errors="coerce").fillna(-1.0)
-assets_view = assets_calc[risk_series >= float(risk_min)].copy()
 
 # ---------------- Activities: PM costs, join CoF/PoF, decisions ----------------
 acts_calc = acts.copy()
