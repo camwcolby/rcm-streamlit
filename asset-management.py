@@ -434,142 +434,89 @@ st.download_button("⬇️ Download activities (tuned)",
 st.divider()
 st.header("What this tool is doing — quick explainer")
 
-# (Optional) live status about proposed_per_year
+# (Optional) live status about proposed_per_year and approvals
 status_bits = []
 if "proposed_per_year" in acts_calc.columns:
     prop_sum = pd.to_numeric(acts_calc["proposed_per_year"], errors="coerce").fillna(0).sum()
-    if prop_sum > 0:
-        status_bits.append("**Proposed data:** found")
-    else:
-        status_bits.append("**Proposed data:** present but zeros → falls back to baseline")
+    status_bits.append("**Proposed data:** found" if prop_sum > 0
+                       else "**Proposed data:** present but zeros → falls back to baseline")
 else:
     status_bits.append("**Proposed data:** not found → using baseline as proposed")
 
+if {"Decision_tuned","cost_baseline_per_year","cost_proposed_per_year","RRV_USD_app"} <= set(acts_calc.columns):
+    # quick portfolio signal
+    is_approved = acts_calc["Decision_tuned"].isin(["INCREASE","REDUCE"])
+    approved_cost = np.where(is_approved, acts_calc["cost_proposed_per_year"], acts_calc["cost_baseline_per_year"])
+    approved_net_delta = (approved_cost - acts_calc["cost_baseline_per_year"]).sum()
+    status_bits.append(f"**Approved net Δcost:** ${approved_net_delta:,.0f}")
+
 st.caption(" • ".join(status_bits))
+
+with st.expander("Baseline vs Proposed vs Approved (how the math flows)", expanded=False):
+    st.markdown("""
+**Baseline** = what you currently do (`baseline_per_year`, `cost_baseline_per_year`).  
+**Proposed** = what the uploaded program suggests (`proposed_per_year`, `cost_proposed_per_year`).  
+**Approved** = what survives the gate: stays **Baseline** unless the row **passes** the decision rule.
+
+**Per row**
+- ΔCost = `cost_proposed_per_year – cost_baseline_per_year`
+- RRV ($) = `ΔPoF × CoF` (benefit of the change; negative if you REDUCE)
+- **Gate**: pass if `RRV ≥ k × ΔCost` (and, if enabled, payback/horizon ok)
+    - If pass → **approved_cost = cost_proposed_per_year**, **approved_RRV = RRV**
+    - If fail → **approved_cost = cost_baseline_per_year**, **approved_RRV = 0`
+
+**Area rollups**
+- `baseline_cost_total = Σ baseline cost`
+- `approved_cost_total = Σ approved_cost`
+- `approved_net_delta = approved_cost_total – baseline_cost_total`
+- `approved_risk_reduction_usd = Σ approved_RRV`
+- `inc_delta_sum = Σ ΔCost` for **approved INCREASE** rows (the extra budget you’d actually add)
+""")
 
 with st.expander("What this thing does (in 60 seconds)", expanded=False):
     st.markdown("""
-You already have a **baseline PM program** (what you do now) and a **proposed PM program** (what you might do next year).
-
-The tool estimates:
-
-- **Probability of Failure (PoF)** for each asset (how likely it is to fail).
-- **Consequence of Failure (CoF)** in dollars (what it costs when it fails).
-- **Annual Risk ($) = PoF × CoF.**
-
-For each maintenance activity, it compares baseline vs proposed:
-
-- **Cost change** (how much more/less you’d spend).
-- **Risk Reduction Value (RRV)** — the dollar value of risk you reduce by doing more/better PM.
-
-It then decides **INCREASE / KEEP_BASELINE / REDUCE** using an ROI-style rule.
+You already have a **baseline PM program** and a **proposed PM program**.  
+The tool estimates **PoF**, **CoF**, and **Annual Risk = PoF × CoF**, then evaluates each activity’s change:
+- **ΔCost** (how spend changes)
+- **RRV** (dollar value of risk reduction)
+A row is **approved** only if it clears the gate (`RRV ≥ k × ΔCost`, plus any payback checks).
 """)
 
 with st.expander("What’s under the hood (light version)", expanded=False):
     st.markdown("""
-**The Jupyter pipeline (offline)**
+**Offline (notebook)**
+- Build `baseline_per_year` from CMMS, read `proposed_per_year` from your adjusted program.
+- Compute PoF (age/condition/compliance/prior risk/rehab) and CoF (downtime + penalties + optional CM event cost).
+- Write two CSVs used here.
 
-- **Read & clean:** Pulls asset lists, PM frequencies, CMMS work history; fixes messy headers/IDs.
-- **Match activities to tasks:** Uses text matching to tie your program activities to real CMMS task text (with safety checks).
-- **Baseline rate:** Counts completed tasks in your history window → `baseline_per_year`.
-- **Proposed rate:** Reads the adjusted program file → `proposed_per_year`.
-- **PoF:** Combines condition/age/compliance/risk and any rehab/replace timing.
-- **CoF:** Composes downtime cost + penalty terms (+ optional CM event cost).
-- **Outputs CSVs** the Streamlit app reads:
-  - Assets ranked by risk
-  - Activities with baseline/proposed, costs, and decisions
-
-**The Streamlit app (interactive)**
-
-- Loads those CSVs.
-- Lets you turn **knobs** and instantly recompute costs, risk, ROI, and decisions.
-- Shows a **portfolio view** (assets by risk) and an **activities view** (what to increase/keep/reduce), plus **area rollups**.
+**In the app**
+- Load the CSVs, apply your knobs, re-evaluate PoF/CoF if you toggle it, then apply the **approval gate**.
+- Show assets by risk, activity decisions/ROI, and **approved** area rollups.
 """)
 
-with st.expander("Key terms (no jargon)", expanded=False):
+with st.expander("Key terms", expanded=False):
     st.markdown("""
-- **PoF:** Likelihood an asset fails within a period (0–1). Higher = riskier.
-- **CoF ($):** Dollar impact when it fails (lost production, compliance penalties, etc.).
-- **Annual Risk ($):** `PoF × CoF`. Your risk exposure in money terms.
-- **`baseline_per_year`:** How many times you currently do the activity each year (from history).
-- **`proposed_per_year`:** How many times you plan to do the activity (from the adjusted program).
-- **`PM_cost_each` ($):** Cost for one activity execution (labor/materials).
-- **RRV ($):** Risk Reduction Value = (change in PoF from the activity) × CoF.
-
-**Decision rule**
-- **INCREASE:** Extra PM is worth it (`RRV ≥ k × ΔCost`).
-- **KEEP_BASELINE:** Proposal didn’t clear the bar.
-- **REDUCE:** Savings outweigh added risk.
+- **PoF:** Likelihood of failure (0–1).  **CoF ($):** Cost when it fails.  
+- **Annual Risk ($):** `PoF × CoF`  
+- **`baseline_per_year` / `proposed_per_year`:** current vs suggested frequency  
+- **`PM_cost_each` ($):** per-execution cost (labor/materials)  
+- **RRV ($):** risk reduction value = `ΔPoF × CoF`  
+- **Approved:** the portfolio after gating; non-approved rows revert to baseline.
 """)
 
 with st.expander("The knobs (what happens when you move them)", expanded=False):
     st.markdown("""
-**Filters**
-- **Area(s):** Just limits what’s on screen. No math changes.
-
-**CoF knobs**
-- **Downtime $/hr ↑** → CoF ↑ → Annual Risk ↑ → RRV ↑ → more **INCREASE** decisions.
-- **Penalty unit $ ↑** (env/safety penalties) → same effect as above.
-- **Replacement-cost factor ↑** → CoF ↑ (if included) → more **INCREASE**.
-
-**PM cost knobs**
-- **Labor rate $/hr** or **Material adder ↑** → `PM_cost_each` ↑ → ΔCost ↑ → ROI falls → fewer **INCREASE** / more **KEEP_BASELINE**.
-
-**Decision line**
-- **k (approval factor):** Higher k = tougher bar (RRV must be much bigger than ΔCost) → fewer **INCREASE**. Lower k → more **INCREASE**.
-
-**PoF recompute (advanced)**
-- Toggle **Recompute PoF** to use the app’s live model (age, condition, compliance, prior risk, rehab urgency).
-- **Weights** (`w_age`, `w_cond`, `w_noncomp`, `w_prior`, `w_rehab`) shift what drives PoF.
-  - Example: raise `w_cond` if inspections are trustworthy; raise `w_rehab` if end-of-life is near.
-- **PoF steepness (k) / bias:** Shape PoF’s S-curve.
-- **Rehab horizon (yrs):** Shorter horizon makes soon-to-be-replaced assets look urgent → higher PoF now.
+- **CoF knobs up →** higher risk → higher RRV → more **INCREASE** approved.
+- **PM cost knobs up or k up →** tougher to clear the gate → fewer **INCREASE** approved.
+- **Recompute PoF / weights:** changes PoF and thus Annual Risk & RRV.
 """)
 
-with st.expander("How to read the views", expanded=False):
+with st.expander("Common gotchas", expanded=False):
     st.markdown("""
-**1) Assets — ranked by annual risk**
-- Sorts assets by Annual Risk ($) using your current knob settings.
-- Use this to see where the risk lives before choosing PM changes.
-
-**2) Activities — decisions & ROI**
-- Each row = one activity on an asset.
-- Shows baseline vs proposed cost, RRV, and `Decision_tuned`.
-- If you see **KEEP_BASELINE** with a large proposed cost: it means you requested an increase, but it didn’t pass the ROI bar. Approved plan stays at baseline.
-
-**3) Area rollups**
-- Sums baseline cost, proposed cost, risk reduction, and net cost delta by area & decision.
-- (Optional improvement) Switch to **approved rollup** (only INCREASE/REDUCE that passed the gate) so budget impact reflects what you’d actually do.
+- **Approved deltas are zero** → nothing cleared the gate. Lower **k**, raise CoF, or check payback.
+- **Costs identical baseline vs proposed** → `proposed_per_year` wasn’t populated; re-run the notebook.
 """)
 
-with st.expander("A practical workflow (5–10 mins)", expanded=False):
-    st.markdown("""
-1. **Scan assets by risk** to see hotspots.
-2. **Set CoF knobs** to reflect reality (downtime $/hr, penalties). Start with defaults; sensitivity-test ±25%.
-3. **Tune the decision line:** start **k = 1.0** (break-even). Raise to **1.2–1.5** for a stricter budget; lower to **0.8–0.9** to be aggressive.
-4. **Check activities:** 
-   - **INCREASE** buckets with high ROI → good candidates to fund.
-   - **REDUCE** buckets → savings opportunities with small modeled risk upsides.
-5. *(Optional)* **Recompute PoF** if you think CSV PoF is off. Adjust weights until the top-risk assets match field intuition.
-6. **Export** the tuned tables for review/budget.
-""")
-
-with st.expander("Common gotchas (and what they mean)", expanded=False):
-    st.markdown("""
-- **Costs identical baseline vs proposed:** your activity CSV is missing `proposed_per_year`; the app uses baseline as fallback. Re-run the notebook to write `proposed_per_year` (it pulls `__per_year_adj` from the adjusted expected file).
-- **Lots of KEEP_BASELINE:** either **k** is high, PM costs are high, or CoF is too low. Try lowering **k**, revisiting CoF, or confirming `PM_cost_each`.
-- **Very high risk in one process:** penalty/downtime settings or rehab horizon might be aggressive — double-check those assumptions.
-""")
-
-with st.expander("One-pager cheat sheet", expanded=False):
-    st.markdown("""
-- **Annual Risk = PoF × CoF** (both set by you or the CSV).
-- **RRV = ΔPoF × CoF** (benefit of more/less PM).
-- **Decision rule:** If `RRV ≥ k × ΔCost` → **INCREASE**; if saving and risk bump is small → **REDUCE**; else **KEEP_BASELINE**.
-- **Raising CoF → more INCREASE.**  
-- **Raising PM cost or k → fewer INCREASE.**  
-- **Shorter rehab horizon / higher rehab weight → higher PoF now.**
-""")
 
 
 
