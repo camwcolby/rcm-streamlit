@@ -1,4 +1,8 @@
-streamlit>=1.35
-pandas>=2.2
-numpy>=1.26
-requests
+# --- Streamlit app deps (curated; no transitive pins) ---
+streamlit==1.36.0
+pandas==2.2.2
+numpy==1.26.4
+openpyxl==3.1.2         # you read .xlsx
+altair==5.1.2           # if you plot with st.altair_chart
+pyarrow==16.1.0         # optional, but speeds csv/feather
+
