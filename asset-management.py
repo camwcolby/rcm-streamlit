@@ -504,83 +504,96 @@ c4.metric("FTEs (proposed)", f"{fte_proposed:,.2f}", delta=f"{(fte_proposed - ft
 st.caption(f"Using **productive hours/FTE = {prod_hours_per_fte:,.0f}** ( = {gross_hours:,.0f} × {util:.0%} utilization )")
 
 # ---- Per-area editable utilization table (advanced)
+# ---- Per-area editable utilization table (safe across Streamlit versions)
 st.subheader("Per-area utilization (optional)")
 
-# Build a small param table seeded with current areas
+# Seed param table with current areas
 areas = sorted(acts_calc["__Area"].dropna().unique().tolist()) if "__Area" in acts_calc.columns else []
 labor_defaults = pd.DataFrame({
     "__Area": areas,
-    "Hours_per_FTE": gross_hours,
-    "Utilization": util
+    "Hours_per_FTE": float(default_hours_per_fte),
+    "Utilization": float(default_util),
 })
-labor_params = st.data_editor(
-    labor_defaults,
-    num_rows="dynamic",
-    use_container_width=True,
-    help="Adjust utilization or hours per FTE by area if they differ."
-)
+
+def _safe_editor(df: pd.DataFrame):
+    """
+    Try st.data_editor; if TypeError (or not available), try experimental_data_editor;
+    else show a static dataframe and return the input unchanged.
+    """
+    # Column configs are optional; they help avoid dtype weirdness
+    colcfg = {
+        "__Area": st.column_config.TextColumn("Area", required=True),
+        "Hours_per_FTE": st.column_config.NumberColumn(
+            "Hours per FTE", min_value=500, max_value=4000, step=10
+        ),
+        "Utilization": st.column_config.NumberColumn(
+            "Utilization (0–1)", min_value=0.05, max_value=1.0, step=0.01, format="%.2f"
+        ),
+    }
+    try:
+        # NOTE: Do NOT pass num_rows="dynamic" — older versions throw TypeError
+        return st.data_editor(
+            df,
+            use_container_width=True,
+            column_config=colcfg,
+            key="labor_editor",
+            help="Adjust utilization or hours per FTE by area if they differ.",
+        )
+    except TypeError:
+        # Older Streamlit – use experimental API (also avoid num_rows)
+        try:
+            return st.experimental_data_editor(  # type: ignore[attr-defined]
+                df,
+                use_container_width=True,
+                key="labor_editor_old",
+            )
+        except Exception:
+            st.warning(
+                "Interactive editor not supported in this Streamlit version; showing a static table."
+            )
+            st.dataframe(df, use_container_width=True)
+            return df
+
+labor_params = _safe_editor(labor_defaults)
 
 # Merge params onto activities and compute per-area FTEs
-if len(labor_params):
-    lp = labor_params.copy()
-    lp["Hours_per_FTE"] = pd.to_numeric(lp["Hours_per_FTE"], errors="coerce").fillna(gross_hours)
-    lp["Utilization"]   = pd.to_numeric(lp["Utilization"], errors="coerce").clip(0.05, 1.0).fillna(util)
-    if "__Area" in acts_calc.columns:
-        tmp = acts_calc.merge(lp, on="__Area", how="left")
-        tmp["Hours_per_FTE"] = tmp["Hours_per_FTE"].fillna(gross_hours)
-        tmp["Utilization"]   = tmp["Utilization"].fillna(util)
-    else:
-        # If Area not present, use global defaults
-        tmp = acts_calc.copy()
-        tmp["Hours_per_FTE"] = gross_hours
-        tmp["Utilization"]   = util
+lp = labor_params.copy()
+lp["Hours_per_FTE"] = pd.to_numeric(lp["Hours_per_FTE"], errors="coerce").fillna(default_hours_per_fte)
+lp["Utilization"]   = pd.to_numeric(lp["Utilization"], errors="coerce").clip(0.05, 1.0).fillna(default_util)
 
-    tmp["Prod_hours_per_FTE"] = (tmp["Hours_per_FTE"] * tmp["Utilization"]).clip(lower=1e-6)
+if "__Area" in acts_calc.columns and len(lp):
+    tmp = acts_calc.merge(lp, on="__Area", how="left")
+else:
+    tmp = acts_calc.copy()
+    tmp["Hours_per_FTE"] = float(default_hours_per_fte)
+    tmp["Utilization"]   = float(default_util)
 
-    # Per-area rollup using the “chosen” plan (approved or proposed/baseline per the toggle)
-    per_area = (tmp
-        .groupby("__Area", dropna=False)[["PM_hours_per_year_baseline","PM_hours_per_year_proposed","PM_hours_per_year_chosen","Prod_hours_per_FTE"]]
-        .sum(min_count=1)
-        .reset_index()
-    )
+tmp["Hours_per_FTE"]   = pd.to_numeric(tmp["Hours_per_FTE"], errors="coerce").fillna(default_hours_per_fte)
+tmp["Utilization"]     = pd.to_numeric(tmp["Utilization"], errors="coerce").clip(0.05, 1.0).fillna(default_util)
+tmp["Prod_hours_per_FTE"] = (tmp["Hours_per_FTE"] * tmp["Utilization"]).clip(lower=1e-6)
 
-    per_area["FTE_baseline"] = per_area["PM_hours_per_year_baseline"] / per_area["Prod_hours_per_FTE"]
-    per_area["FTE_proposed"] = per_area["PM_hours_per_year_proposed"] / per_area["Prod_hours_per_FTE"]
-    per_area["FTE_chosen"]   = per_area["PM_hours_per_year_chosen"]   / per_area["Prod_hours_per_FTE"]
-    per_area["ΔFTE (proposed - baseline)"] = per_area["FTE_proposed"] - per_area["FTE_baseline"]
+per_area = (tmp
+    .groupby("__Area", dropna=False)[
+        ["PM_hours_per_year_baseline","PM_hours_per_year_proposed","PM_hours_per_year_chosen","Prod_hours_per_FTE"]
+    ].sum(min_count=1).reset_index()
+)
 
-    show_cols = [
-        "__Area",
-        "PM_hours_per_year_baseline","PM_hours_per_year_proposed","PM_hours_per_year_chosen",
-        "Prod_hours_per_FTE","FTE_baseline","FTE_proposed","FTE_chosen","ΔFTE (proposed - baseline)"
-    ]
-    st.dataframe(per_area[show_cols], use_container_width=True)
+per_area["FTE_baseline"] = per_area["PM_hours_per_year_baseline"] / per_area["Prod_hours_per_FTE"]
+per_area["FTE_proposed"] = per_area["PM_hours_per_year_proposed"] / per_area["Prod_hours_per_FTE"]
+per_area["FTE_chosen"]   = per_area["PM_hours_per_year_chosen"]   / per_area["Prod_hours_per_FTE"]
+per_area["ΔFTE (proposed - baseline)"] = per_area["FTE_proposed"] - per_area["FTE_baseline"]
 
-    # Export
-    csv = per_area.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Download labor-by-area CSV", data=csv, file_name="labor_by_area.csv", mime="text/csv")
+show_cols = [
+    "__Area",
+    "PM_hours_per_year_baseline","PM_hours_per_year_proposed","PM_hours_per_year_chosen",
+    "Prod_hours_per_FTE","FTE_baseline","FTE_proposed","FTE_chosen","ΔFTE (proposed - baseline)"
+]
+st.dataframe(per_area[show_cols], use_container_width=True)
 
-# ---- By decision (nice for staffing discussions)
-st.subheader("Labor by decision (baseline vs proposed)")
-by_dec = (acts_calc
-          .assign(PM_hours_baseline=acts_calc["PM_hours_per_year_baseline"],
-                  PM_hours_proposed=acts_calc["PM_hours_per_year_proposed"])
-          .groupby("Decision_tuned", dropna=False)[["PM_hours_baseline","PM_hours_proposed"]]
-          .sum(min_count=1)
-          .reset_index())
-st.dataframe(by_dec, use_container_width=True)
+# Export
+csv = per_area.to_csv(index=False).encode("utf-8-sig")
+st.download_button("Download labor-by-area CSV", data=csv, file_name="labor_by_area.csv", mime="text/csv")
 
-
-# ---------------- Quick debug ----------------
-st.caption("Quick debug:")
-st.write({
-    "assets: PoF_app>0": int((pd.to_numeric(assets_calc["PoF_app"], errors="coerce")>0).sum()),
-    "assets: CoF_USD_app>0": int((pd.to_numeric(assets_calc["CoF_USD_app"], errors="coerce")>0).sum()),
-    "join coverage (CoF in acts)": f"{(acts_calc['CoF_USD_app'].notna().mean()*100):.1f}%",
-    "acts: baseline>0": int((acts_calc["baseline_per_year"]>0).sum()),
-    "acts: proposed>0": int((acts_calc["proposed_per_year"]>0).sum()),
-    "acts: RRV_USD_app>0": int((pd.to_numeric(acts_calc["RRV_USD_app"], errors='coerce')>0).sum()),
-})
 
 # ---------------- Downloads ----------------
 st.download_button("⬇️ Download assets (filtered)",
