@@ -427,12 +427,14 @@ acts_df = (acts_calc[view_cols]
            .copy())
 st.dataframe(format_money_styler(acts_df), use_container_width=True)
 
-# ---------------- Labor summary (read-only, interactive table) ----------------
-# Global knobs (delete if you already set these above)
-util_global = st.slider("Technician utilization (0–1)", 0.50, 1.00, 0.80, 0.05)
-hours_per_fte_global = st.number_input("Hours per FTE per year", min_value=1200, max_value=2200, value=1800, step=50)
+# ---------------- Labor — hours & FTEs (read-only) ----------------
+st.subheader("Labor — hours & FTEs (read-only)")
 
-# Pick the column names your app is using for yearly counts
+# Global labor assumptions
+util_global = st.slider("Technician utilization (0–1)", 0.50, 1.00, 0.80, 0.05)
+hours_per_fte_global = st.number_input("Hours per FTE per year", min_value=1200, max_value=2200, value=2080, step=40)
+
+# Pick the yearly-rate columns present in your activities table
 bpy_col = "baseline_per_year_app" if "baseline_per_year_app" in acts_calc.columns else "baseline_per_year"
 ppy_col = "proposed_per_year_app" if "proposed_per_year_app" in acts_calc.columns else "proposed_per_year"
 
@@ -450,13 +452,11 @@ labor_rollup = (
              .reset_index()
 )
 
-# Attach global labor assumptions (per area)
+# Attach global assumptions per area
 labor_rollup["Utilization"] = float(util_global)
 labor_rollup["Hours_per_FTE_per_year"] = float(hours_per_fte_global)
 
-den = labor_rollup["Hours_per_FTE_per_year"] * labor_rollup["Utilization"]
-den = den.replace(0, np.nan)
-
+den = (labor_rollup["Hours_per_FTE_per_year"] * labor_rollup["Utilization"]).replace(0, np.nan)
 labor_rollup["FTE_baseline"] = labor_rollup["PM_hours_base"] / den
 labor_rollup["FTE_proposed"] = labor_rollup["PM_hours_prop"] / den
 labor_rollup["PM_hours_delta"] = labor_rollup["PM_hours_prop"] - labor_rollup["PM_hours_base"]
@@ -478,8 +478,7 @@ tot["FTE_delta"] = tot["FTE_proposed"] - tot["FTE_baseline"]
 
 labor_view = pd.concat([labor_rollup, tot], ignore_index=True)
 
-# Display (read-only but sortable/scrollable)
-st.subheader("Labor — hours & FTEs (read-only)")
+# Display (sortable, scrollable, read-only)
 st.dataframe(
     labor_view[
         ["__Area",
@@ -489,6 +488,7 @@ st.dataframe(
     ].sort_values("__Area"),
     use_container_width=True,
 )
+
 
 # ---------------- Downloads ----------------
 st.download_button("⬇️ Download assets (filtered)",
