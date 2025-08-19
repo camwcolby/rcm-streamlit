@@ -1,9 +1,10 @@
-# ==================== RCM Explorer — Portfolio (patched) ====================
-# Fixes:
+# ==================== RCM Explorer — Portfolio (patched, fixed assets_view) ====================
+# Fixes vs prior file:
 #  - Robust CoF/PoF construction (no NaNs even with $/comma strings)
 #  - Key normalization identical across assets & activities
 #  - Join fallback: if (__Area, __AssetID_norm) misses, retry on __AssetID_norm only
-#  - Clear coverage debug + safer filters (avoid "empty" assets table)
+#  - Clear coverage debug + safer filters
+#  - ✅ Define assets_view before first use (prevents NameError)
 
 import os, io, re
 import requests
@@ -257,25 +258,15 @@ if recompute_pof:
     yrs_to = next_y - float(pd.Timestamp.now().year)
     urg01  = ((float(rx_horizon_years) - yrs_to) / float(rx_horizon_years)).clip(0.0, 1.0).fillna(0.0)
 
-    # Use whichever non-compliance weight you actually named in the UI
-    try:
-        w_noncomp_eff = float(w_noncomp)
-    except NameError:
-        w_noncomp_eff = float(w_ncomp)
-
     # Normalize weights so the scale is stable
-    tot = max(1e-9, float(w_age) + float(w_cond) + w_noncomp_eff + float(w_risk) + float(w_rx))
+    tot = max(1e-9, float(w_age) + float(w_cond) + float(w_ncomp) + float(w_risk) + float(w_rx))
     w_age_n   = float(w_age)   / tot
     w_cond_n  = float(w_cond)  / tot
-    w_ncomp_n = w_noncomp_eff  / tot
+    w_ncomp_n = float(w_ncomp) / tot
     w_risk_n  = float(w_risk)  / tot
     w_rx_n    = float(w_rx)    / tot
 
-    lin = (w_age_n*age01 +
-           w_cond_n*cond01 +
-           w_ncomp_n*noncomp01 +
-           w_risk_n*risk01 +
-           w_rx_n*urg01)
+    lin = (w_age_n*age01 + w_cond_n*cond01 + w_ncomp_n*noncomp01 + w_risk_n*risk01 + w_rx_n*urg01)
     assets_calc["PoF_app"] = sigmoid(lin, k=float(sigmoid_k_ui), bias=float(pof_bias)).clip(0, 1).fillna(0.0)
 else:
     assets_calc["PoF_app"] = pd.to_numeric(assets_calc.get("PoF", 0.5), errors="coerce").clip(0, 1).fillna(0.5)
@@ -286,6 +277,9 @@ assets_calc["Annual_Risk_USD_app"] = (
     pd.to_numeric(assets_calc["CoF_USD_app"], errors="coerce").fillna(0.0)
 )
 
+# ✅ Define assets_view BEFORE first use
+risk_series = pd.to_numeric(assets_calc["Annual_Risk_USD_app"], errors="coerce").fillna(-1.0)
+assets_view = assets_calc[risk_series >= float(risk_min)].copy()
 
 # ---------------- Activities: PM costs, join CoF/PoF, decisions ----------------
 acts_calc = acts.copy()
@@ -539,6 +533,7 @@ with st.expander("Common gotchas", expanded=False):
 - **Approved deltas are zero** → nothing cleared the gate. Lower **k**, raise CoF, or check payback.
 - **Costs identical baseline vs proposed** → `proposed_per_year` wasn’t populated; re-run the notebook.
 """)
+
 
 
 
