@@ -91,6 +91,71 @@ except Exception:
 #    f"Assets: {assets_src} | Activities: {acts_src}"
 #    + (f" | Gap: {gap_src}" if gap_src else " | Gap: (not loaded)")
 #)
+# --- Data sanity + resilient fallbacks (drop this after the "Load CSVs" section) ---
+
+# 1) If proposed_per_year is missing, try to reconstruct; else fall back to baseline
+if "proposed_per_year" not in acts.columns:
+    if {"cost_proposed_per_year","PM_cost_each"} <= set(acts.columns):
+        pmcost = pd.to_numeric(acts["PM_cost_each"], errors="coerce").replace(0, np.nan)
+        acts["proposed_per_year"] = (
+            pd.to_numeric(acts["cost_proposed_per_year"], errors="coerce") / pmcost
+        ).fillna(0.0).clip(lower=0.0)
+        st.warning("Reconstructed proposed_per_year = cost_proposed_per_year / PM_cost_each (column was missing).")
+    else:
+        acts["proposed_per_year"] = pd.to_numeric(acts.get("baseline_per_year", 0.0), errors="coerce").fillna(0.0)
+        st.warning("No proposed_per_year and cannot reconstruct from costs → using baseline_per_year as proposed_per_year.")
+
+# 2) If baseline coverage is suspiciously low, try to rebuild baseline from GAP
+try:
+    bpy = pd.to_numeric(acts.get("baseline_per_year", 0.0), errors="coerce").fillna(0.0)
+    coverage = float((bpy > 0).mean())
+except Exception:
+    coverage = 0.0
+
+if coverage < 0.20 and gap is not None and len(gap):
+    st.info(f"Baseline coverage is low ({coverage:.1%}). Rebuilding from gap_activity_level_exact.csv …")
+    # Normalize keys on gap
+    gap = gap.copy()
+    gap.columns = gap.columns.astype(str).str.strip()
+    def _norm_id_str(x):
+        s = "" if pd.isna(x) else str(x)
+        s = s.replace(",", "")
+        s = re.sub(r"\.0$", "", s)
+        s = re.sub(r"\s+","", s)
+        return s.upper()
+    def _norm_txt(x):
+        s = "" if pd.isna(x) else str(x).upper()
+        s = re.sub(r"[^A-Z0-9 ]+"," ", s)
+        return re.sub(r"\s+"," ", s).strip()
+
+    gap["__Area"]         = gap.get("__Area","").astype(str).str.strip()
+    gap["__AssetID_norm"] = gap.get("__AssetID_norm","").map(_norm_id_str)
+    # match your app’s normalizer for activities
+    act_col = "Activity" if "Activity" in gap.columns else gap.columns[0]
+    gap["Activity_norm_app"] = gap[act_col].astype(str).map(_norm_txt)
+
+    # roll up completions across the window you used to create GAP (your YEARS is already set)
+    base2 = (gap.rename(columns={"Completed_Count":"_cmpl"})
+                .groupby(["__Area","__AssetID_norm","Activity_norm_app"], dropna=False)["_cmpl"]
+                .sum()
+                .reset_index())
+    base2["baseline_per_year_rebuilt"] = base2["_cmpl"] / YEARS
+
+    # normalize acts keys and merge
+    acts["Activity_norm_app"] = acts.get("Activity","").astype(str).map(_norm_txt)
+    acts = acts.merge(
+        base2[["__Area","__AssetID_norm","Activity_norm_app","baseline_per_year_rebuilt"]],
+        on=["__Area","__AssetID_norm","Activity_norm_app"], how="left"
+    )
+    # fill when original baseline was 0 or NaN
+    acts["baseline_per_year"] = pd.to_numeric(acts.get("baseline_per_year", 0.0), errors="coerce")
+    acts.loc[(acts["baseline_per_year"].isna()) | (acts["baseline_per_year"]<=0), "baseline_per_year"] = \
+        acts["baseline_per_year_rebuilt"].fillna(0.0)
+    acts.drop(columns=["baseline_per_year_rebuilt"], inplace=True)
+
+    # show improved coverage
+    new_cov = float((pd.to_numeric(acts["baseline_per_year"], errors="coerce").fillna(0.0) > 0).mean())
+    st.success(f"Baseline rebuilt. Coverage improved to {new_cov:.1%}.")
 
 # ==================== Helpers ====================
 def norm_text(s):
