@@ -427,6 +427,150 @@ acts_df = (acts_calc[view_cols]
            .copy())
 st.dataframe(format_money_styler(acts_df), use_container_width=True)
 
+# ==================== Labor planning (hours → FTEs) ====================
+st.divider()
+st.header("Labor — staffing view")
+
+with st.sidebar.expander("Labor planning knobs", expanded=False):
+    # If your app already has a labor rate, keep using it; this is only for FTE math
+    default_hours_per_fte = st.number_input(
+        "Hours per FTE per year (gross)", min_value=1000, max_value=3000, value=2080, step=40,
+        help="Traditional is ~2080. Use your org’s gross annual hours before utilization."
+    )
+    default_util = st.slider(
+        "Utilization (productive share of an FTE’s year)", min_value=0.10, max_value=1.00,
+        value=0.70, step=0.05,
+        help="Share of the year available for PM work after meetings, training, leave, travel, etc."
+    )
+    use_hist_hours = st.checkbox(
+        "Prefer historical median PM hours (PM_hours_hist) when available",
+        value=True,
+        help="If your pipeline wrote PM_hours_hist from CMMS, use it in place of PM_hours for labor calc."
+    )
+    include_only_approved = st.checkbox(
+        "Base FTE on approved (tuned) decisions only",
+        value=False,
+        help="When ON: INCREASE rows count proposed hours, REDUCE rows count baseline hours, KEEP uses baseline."
+    )
+
+# ---- Safe numeric columns
+def _num(s, default=0.0):
+    return pd.to_numeric(acts_calc.get(s, default), errors="coerce").fillna(default)
+
+# Effective hours per event: prefer hist if asked & present
+pm_hours_eff = _num("PM_hours", 2.0)
+if use_hist_hours and "PM_hours_hist" in acts_calc.columns:
+    pm_hours_hist = _num("PM_hours_hist", np.nan)
+    pm_hours_eff = np.where(pd.notna(pm_hours_hist), pm_hours_hist, pm_hours_eff)
+pm_hours_eff = pd.Series(pm_hours_eff, index=acts_calc.index, name="PM_hours_eff")
+
+# Event rates
+bpy = _num("baseline_per_year", 0.0)
+ppy = _num("proposed_per_year", 0.0)
+
+# Which rate to use depends on whether we’re looking at approved/tuned decisions
+if include_only_approved and "Decision_tuned" in acts_calc.columns:
+    # Proposed hours for INCREASE, baseline for KEEP/REDUCE
+    decision = acts_calc["Decision_tuned"].astype(str).str.upper()
+    chosen_rate = np.where(decision == "INCREASE", ppy, bpy)
+else:
+    # Straight comparison of baseline vs proposed
+    chosen_rate = ppy
+
+# Hours per year (baseline/proposed and the chosen “approved” view)
+acts_calc["PM_hours_per_year_baseline"] = bpy * pm_hours_eff
+acts_calc["PM_hours_per_year_proposed"] = ppy * pm_hours_eff
+acts_calc["PM_hours_per_year_chosen"]   = chosen_rate * pm_hours_eff
+
+# Rollups — overall
+gross_hours = float(default_hours_per_fte)
+util        = float(default_util)
+prod_hours_per_fte = max(1e-6, gross_hours * util)
+
+total_hours_baseline = float(acts_calc["PM_hours_per_year_baseline"].sum())
+total_hours_proposed = float(acts_calc["PM_hours_per_year_proposed"].sum())
+total_hours_chosen   = float(acts_calc["PM_hours_per_year_chosen"].sum())
+
+fte_baseline = total_hours_baseline / prod_hours_per_fte
+fte_proposed = total_hours_proposed / prod_hours_per_fte
+fte_chosen   = total_hours_chosen   / prod_hours_per_fte
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total PM hours (baseline/yr)", f"{total_hours_baseline:,.0f}")
+c2.metric("Total PM hours (proposed/yr)", f"{total_hours_proposed:,.0f}")
+c3.metric("FTEs (baseline)", f"{fte_baseline:,.2f}")
+c4.metric("FTEs (proposed)", f"{fte_proposed:,.2f}", delta=f"{(fte_proposed - fte_baseline):+.2f}")
+
+st.caption(f"Using **productive hours/FTE = {prod_hours_per_fte:,.0f}** ( = {gross_hours:,.0f} × {util:.0%} utilization )")
+
+# ---- Per-area editable utilization table (advanced)
+st.subheader("Per-area utilization (optional)")
+
+# Build a small param table seeded with current areas
+areas = sorted(acts_calc["__Area"].dropna().unique().tolist()) if "__Area" in acts_calc.columns else []
+labor_defaults = pd.DataFrame({
+    "__Area": areas,
+    "Hours_per_FTE": gross_hours,
+    "Utilization": util
+})
+labor_params = st.data_editor(
+    labor_defaults,
+    num_rows="dynamic",
+    use_container_width=True,
+    help="Adjust utilization or hours per FTE by area if they differ."
+)
+
+# Merge params onto activities and compute per-area FTEs
+if len(labor_params):
+    lp = labor_params.copy()
+    lp["Hours_per_FTE"] = pd.to_numeric(lp["Hours_per_FTE"], errors="coerce").fillna(gross_hours)
+    lp["Utilization"]   = pd.to_numeric(lp["Utilization"], errors="coerce").clip(0.05, 1.0).fillna(util)
+    if "__Area" in acts_calc.columns:
+        tmp = acts_calc.merge(lp, on="__Area", how="left")
+        tmp["Hours_per_FTE"] = tmp["Hours_per_FTE"].fillna(gross_hours)
+        tmp["Utilization"]   = tmp["Utilization"].fillna(util)
+    else:
+        # If Area not present, use global defaults
+        tmp = acts_calc.copy()
+        tmp["Hours_per_FTE"] = gross_hours
+        tmp["Utilization"]   = util
+
+    tmp["Prod_hours_per_FTE"] = (tmp["Hours_per_FTE"] * tmp["Utilization"]).clip(lower=1e-6)
+
+    # Per-area rollup using the “chosen” plan (approved or proposed/baseline per the toggle)
+    per_area = (tmp
+        .groupby("__Area", dropna=False)[["PM_hours_per_year_baseline","PM_hours_per_year_proposed","PM_hours_per_year_chosen","Prod_hours_per_FTE"]]
+        .sum(min_count=1)
+        .reset_index()
+    )
+
+    per_area["FTE_baseline"] = per_area["PM_hours_per_year_baseline"] / per_area["Prod_hours_per_FTE"]
+    per_area["FTE_proposed"] = per_area["PM_hours_per_year_proposed"] / per_area["Prod_hours_per_FTE"]
+    per_area["FTE_chosen"]   = per_area["PM_hours_per_year_chosen"]   / per_area["Prod_hours_per_FTE"]
+    per_area["ΔFTE (proposed - baseline)"] = per_area["FTE_proposed"] - per_area["FTE_baseline"]
+
+    show_cols = [
+        "__Area",
+        "PM_hours_per_year_baseline","PM_hours_per_year_proposed","PM_hours_per_year_chosen",
+        "Prod_hours_per_FTE","FTE_baseline","FTE_proposed","FTE_chosen","ΔFTE (proposed - baseline)"
+    ]
+    st.dataframe(per_area[show_cols], use_container_width=True)
+
+    # Export
+    csv = per_area.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Download labor-by-area CSV", data=csv, file_name="labor_by_area.csv", mime="text/csv")
+
+# ---- By decision (nice for staffing discussions)
+st.subheader("Labor by decision (baseline vs proposed)")
+by_dec = (acts_calc
+          .assign(PM_hours_baseline=acts_calc["PM_hours_per_year_baseline"],
+                  PM_hours_proposed=acts_calc["PM_hours_per_year_proposed"])
+          .groupby("Decision_tuned", dropna=False)[["PM_hours_baseline","PM_hours_proposed"]]
+          .sum(min_count=1)
+          .reset_index())
+st.dataframe(by_dec, use_container_width=True)
+
+
 # ---------------- Quick debug ----------------
 st.caption("Quick debug:")
 st.write({
