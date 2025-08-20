@@ -1,3 +1,38 @@
+import os, sys, hashlib, inspect, pathlib, datetime as dt
+
+def _file_hash(p):
+    try:
+        with open(p, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception:
+        return "N/A"
+
+THIS_FILE = inspect.getfile(inspect.currentframe())
+THIS_PATH = pathlib.Path(THIS_FILE).resolve()
+MTIME = dt.datetime.fromtimestamp(THIS_PATH.stat().st_mtime)
+
+try:
+    import streamlit as st
+    with st.sidebar:
+        st.markdown("### 🔎 Debug Info")
+        st.write({
+            "Running file": str(THIS_PATH),
+            "File hash": _file_hash(THIS_PATH),
+            "File modified": MTIME.isoformat(),
+            "CWD": os.getcwd(),
+            "Python": sys.executable,
+            "Python version": sys.version.split()[0],
+        })
+
+        if st.button("Clear Streamlit caches"):
+            try: st.cache_data.clear()
+            except: pass
+            try: st.cache_resource.clear()
+            except: pass
+            st.success("Caches cleared. Press 'Rerun'.")
+except Exception:
+    pass
+
 # ==================== RCM Explorer — Portfolio (patched, fixed assets_view) ====================
 # Fixes vs prior file:
 #  - Robust CoF/PoF construction (no NaNs even with $/comma strings)
