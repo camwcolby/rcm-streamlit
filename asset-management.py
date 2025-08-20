@@ -1,3 +1,8 @@
+APP_VERSION = "asset-management 2025-08-20 09:05 CT (v1)"  # <-- bump this every edit
+
+import streamlit as st
+st.sidebar.markdown(f"**App Version:** `{APP_VERSION}`")
+
 import os, sys, hashlib, inspect, pathlib, datetime as dt
 
 def _file_hash(p):
@@ -620,6 +625,7 @@ with st.expander("Common gotchas", expanded=False):
 - **Approved deltas are zero** → nothing cleared the gate. Lower **k**, raise CoF, or check payback.
 - **Costs identical baseline vs proposed** → `proposed_per_year` wasn’t populated; re-run the notebook.
 """)
+
 
 
 
